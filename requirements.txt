@@ -1,0 +1,15 @@
+# Install a CUDA build of PyTorch >= 2.6 first (transformers 4.55 only loads .bin
+# checkpoints such as microsoft/wavlm-base-plus-sv with torch >= 2.6), e.g.
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+# transformers 4.55.0 is the version the DiCoW repo pins, so one env runs everything.
+transformers==4.55.0
+tokenizers==0.21.4
+peft==0.17.1
+jiwer==4.0.0
+soundfile>=0.12
+scipy>=1.10
+numpy==1.26.4
+tqdm
+safetensors
+pandas          # LibriMix generation script
+pytest

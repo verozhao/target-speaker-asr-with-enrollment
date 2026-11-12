@@ -1,0 +1,2 @@
+# Only for the TitaNet speaker-embedding baseline (--spk-encoder titanet).
+nemo_toolkit[asr]

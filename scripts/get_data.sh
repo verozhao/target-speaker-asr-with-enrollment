@@ -2,9 +2,11 @@
 # Download LibriSpeech, WHAM! noise and OpenSLR 28 RIRs, then generate
 # Libri2Mix (train-100, dev, test) and Libri3Mix (test) at 16 kHz, max mode,
 # with the official LibriMix metadata and script.
+# WITH_960=1 (default) also downloads train-clean-360 and train-other-500 so that
+# training mixtures can be made on the fly from all of LibriSpeech 960.
 #
 # Usage: bash scripts/get_data.sh /path/to/storage
-# Needs ~120 GB free. Python deps for LibriMix: soundfile pandas numpy scipy tqdm.
+# Needs ~120 GB free (+ ~60 GB for the 960 h subsets). LibriMix deps: soundfile pandas numpy scipy tqdm.
 set -euo pipefail
 
 STORAGE=$(mkdir -p "${1:?usage: get_data.sh STORAGE_DIR}" && cd "$1" && pwd)
@@ -15,7 +17,9 @@ fetch() {  # url
   wget -c --tries=0 --read-timeout=20 "$1" -P "$STORAGE"
 }
 
-for s in train-clean-100 dev-clean test-clean; do
+SUBSETS="train-clean-100 dev-clean test-clean"
+[ "${WITH_960:-1}" = "1" ] && SUBSETS="$SUBSETS train-clean-360 train-other-500"
+for s in $SUBSETS; do
   if [ ! -d "LibriSpeech/$s" ]; then
     fetch "http://www.openslr.org/resources/12/$s.tar.gz"
     tar -xzf "$s.tar.gz" && rm "$s.tar.gz"

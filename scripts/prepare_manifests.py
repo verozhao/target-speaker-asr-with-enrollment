@@ -20,10 +20,12 @@ import json
 import os
 import sys
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import soundfile as sf
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from tsasr.librispeech import load_or_build  # noqa: E402
 
 SUBSET = {"train-100": "train-clean-100", "train-360": "train-clean-360", "dev": "dev-clean",
           "test": "test-clean"}
@@ -31,35 +33,6 @@ SUBSET = {"train-100": "train-clean-100", "train-360": "train-clean-360", "dev":
 
 def h(*parts) -> int:
     return int(hashlib.sha1("|".join(map(str, parts)).encode()).hexdigest()[:12], 16)
-
-
-def index_librispeech(root: str, subset: str, cache: str):
-    if os.path.exists(cache):
-        with open(cache) as f:
-            return json.load(f)
-    utts = {}
-    base = os.path.join(root, subset)
-    for spk in sorted(os.listdir(base)):
-        sd = os.path.join(base, spk)
-        if not os.path.isdir(sd):
-            continue
-        for ch in sorted(os.listdir(sd)):
-            cd = os.path.join(sd, ch)
-            tf = os.path.join(cd, f"{spk}-{ch}.trans.txt")
-            if not os.path.exists(tf):
-                continue
-            with open(tf) as f:
-                for ln in f:
-                    uid, text = ln.strip().split(" ", 1)
-                    utts[uid] = {"utt_id": uid, "speaker": spk, "text": text,
-                                 "path": os.path.abspath(os.path.join(cd, uid + ".flac"))}
-    with ThreadPoolExecutor(16) as ex:
-        durs = list(ex.map(lambda u: sf.info(u["path"]).duration, utts.values()))
-    for u, d in zip(utts.values(), durs):
-        u["duration"] = round(d, 3)
-    with open(cache, "w") as f:
-        json.dump(utts, f)
-    return utts
 
 
 def main():
@@ -70,14 +43,14 @@ def main():
     p.add_argument("--split", required=True, choices=sorted(SUBSET))
     p.add_argument("--mix-type", default="mix_clean")
     p.add_argument("--out-dir", required=True)
-    p.add_argument("--prefer-min-dur", type=float, default=11.0)
+    p.add_argument("--prefer-min-dur", type=float, default=11.0,
+                   help="prefer enrollment utterances this long (10 s crops for the length test)")
     p.add_argument("--gap", type=float, default=0.5)
     a = p.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
 
     subset = SUBSET[a.split]
-    utts = index_librispeech(a.librispeech_dir, subset,
-                             os.path.join(a.out_dir, f"librispeech_{subset}_index.json"))
+    utts = load_or_build(a.librispeech_dir, subset, os.path.join(a.out_dir, f"librispeech_{subset}_index.json"))
     by_spk = defaultdict(list)
     for u in utts.values():
         by_spk[u["speaker"]].append(u)
@@ -159,7 +132,8 @@ def main():
                "mixture_sec": {"mean": round(float(d.mean()), 2), "max": round(float(d.max()), 2)},
                "enrollment_sec": {"mean": round(float(ed.mean()), 2), "min": round(float(ed.min()), 2)},
                "fits_30s_with_enrollment": {f"{t:g}s": int(np.sum(d + a.gap + t + 0.02 <= 30.0))
-                                            for t in (1, 2, 5, 10)}}
+                                            for t in (1, 2, 5, 10)},
+               "mixture_over_24.5s": int(np.sum(d > 24.48))}
     # speaker overlap with manifests of other splits already in out_dir
     overlaps = {}
     for fn in os.listdir(a.out_dir):

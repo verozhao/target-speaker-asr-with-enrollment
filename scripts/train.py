@@ -1,7 +1,10 @@
 #!/usr/bin/env python
-"""Fine-tune Whisper with LoRA for enrollment-conditioned target-speaker ASR.
+"""Fine-tune Whisper (LoRA or full) for enrollment-conditioned target-speaker ASR.
 
-Single GPU:   python scripts/train.py --train-manifest ... --out-dir exp/prefix
+Training data, one of:
+  --train-manifest data/libri2mix_train-100.jsonl          pre-built Libri2Mix
+  --train-index data/librispeech_960_index.json            LibriMix-style mixtures made on the fly
+Single GPU:   python scripts/train.py --train-index ... --dev-manifest ... --out-dir exp/prefix
 Multi GPU:    torchrun --nproc_per_node 4 scripts/train.py ...
 Re-running the same command resumes from <out-dir>/last automatically.
 """
@@ -23,20 +26,32 @@ from torch.utils.data import DataLoader, Sampler
 from transformers import WhisperFeatureExtractor, WhisperTokenizer, get_cosine_schedule_with_warmup
 
 from tsasr.augment import TRAIN_MODES, Augmenter
-from tsasr.data import Collator, DataConfig, Tokens, TSASRDataset, fits, read_manifest
+from tsasr.data import (Collator, DataConfig, ManifestDataset, OnTheFlyMixDataset, Tokens, fits,
+                        max_mixture_sec, read_manifest)
 from tsasr.evaluation import autocast, decode, score, subset
+from tsasr.librispeech import read_index
 from tsasr.model import SpeakerEncoder, TSWhisper
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--train-manifest", required=True)
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--train-manifest", help="pre-built mixtures (e.g. Libri2Mix train-100)")
+    src.add_argument("--train-index", nargs="+", help="LibriSpeech index json(s): mix on the fly")
+    p.add_argument("--n-src-probs", default="2:1.0", help="on-the-fly speaker counts, e.g. 2:0.7,3:0.3")
+    p.add_argument("--overlap", default="full", choices=["full", "partial"], help="on-the-fly overlap")
+    p.add_argument("--samples-per-epoch", type=int, default=50000, help="on-the-fly examples per epoch")
     p.add_argument("--dev-manifest", required=True)
     p.add_argument("--speaker-pool", default=None, help="train speaker pool json (random enrollment per epoch)")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--model", default="openai/whisper-small")
-    p.add_argument("--conditioning", default="prefix", choices=["prefix", "spk_emb"])
-    p.add_argument("--spk-encoder", default="wavlm", choices=["wavlm", "ecapa"])
+    p.add_argument("--conditioning", default="prefix", choices=["prefix", "spk_emb", "none"],
+                   help="prefix = ours, spk_emb = embedding baseline, none = no-conditioning baseline")
+    p.add_argument("--spk-encoder", default="wavlm", choices=["wavlm", "titanet", "ecapa"])
+    p.add_argument("--separator", default="silence", choices=["silence", "learned"])
+    p.add_argument("--position", default="prefix", choices=["prefix", "suffix"], help="enrollment before/after the mixture")
+    p.add_argument("--random-lead", action="store_true", help="random start position inside the 30 s window")
+    p.add_argument("--full-ft", action="store_true", help="full fine-tuning instead of LoRA (use a lower --lr)")
     p.add_argument("--aux", default="none", choices=["none", "activity", "contrastive"])
     p.add_argument("--aux-weight", type=float, default=0.1)
     # augmentation
@@ -48,9 +63,9 @@ def parse_args():
     p.add_argument("--snr-min", type=float, default=0.0)
     p.add_argument("--snr-max", type=float, default=20.0)
     # enrollment
-    p.add_argument("--enroll-min", type=float, default=1.0)
-    p.add_argument("--enroll-max", type=float, default=10.0)
-    p.add_argument("--gap", type=float, default=0.5)
+    p.add_argument("--enroll-min", type=float, default=5.0, help="5/5 = fixed 5 s (spec); 1/10 = random-length ablation")
+    p.add_argument("--enroll-max", type=float, default=5.0)
+    p.add_argument("--gap", type=float, default=None, help="separator seconds (default 0.5 silence, 0.02 learned)")
     p.add_argument("--no-random-enrollment", action="store_true")
     # LoRA
     p.add_argument("--lora-r", type=int, default=32)
@@ -72,12 +87,17 @@ def parse_args():
     # eval / logging
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--dev-subset", type=int, default=500)
-    p.add_argument("--dev-enroll-dur", type=float, default=5.0)
+    p.add_argument("--dev-enroll-dur", type=float, default=None, help="default: --enroll-max")
     p.add_argument("--dev-batch-size", type=int, default=16)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max-train-examples", type=int, default=None, help="debug: cap training set")
-    return p.parse_args()
+    a = p.parse_args()
+    if a.gap is None:
+        a.gap = 0.02 if a.separator == "learned" else 0.5
+    if a.dev_enroll_dur is None:
+        a.dev_enroll_dur = a.enroll_max
+    return a
 
 
 class EpochSampler(Sampler):
@@ -147,37 +167,46 @@ def main():
     collate = Collator(tokens.pad)
 
     # ---------------------------------------------------------------- data
-    train_ex = read_manifest(args.train_manifest)
-    n_all = len(train_ex)
-    if args.conditioning == "prefix":
-        train_ex = [e for e in train_ex if fits(e, args.enroll_min, args.gap)]
-    else:
-        train_ex = [e for e in train_ex if e["duration"] <= 30.0]
-    if args.max_train_examples:
-        train_ex = train_ex[: args.max_train_examples]
-    pool = None
-    if args.speaker_pool and not args.no_random_enrollment:
-        with open(args.speaker_pool) as f:
-            pool = json.load(f)
     augmenter = Augmenter(args.noise_list, args.rir_list, args.aug, args.p_noise, args.p_rir,
                           (args.snr_min, args.snr_max)) if args.aug != "none" else None
-    train_cfg = DataConfig(conditioning=args.conditioning, gap_sec=args.gap, train=True,
+    train_cfg = DataConfig(conditioning=args.conditioning, gap_sec=args.gap, position=args.position,
+                           random_lead=args.random_lead, train=True,
                            enroll_min=args.enroll_min, enroll_max=args.enroll_max,
                            random_enrollment=not args.no_random_enrollment,
                            frame_labels=args.aux != "none", seed=args.seed)
-    train_ds = TSASRDataset(train_ex, fe, tokens, train_cfg, augmenter=augmenter, speaker_pool=pool)
+    # every system trains on the same mixtures: those that fit next to the longest enrollment
+    max_mix = max_mixture_sec(args.enroll_max, args.gap)
+    if args.train_manifest:
+        train_ex = read_manifest(args.train_manifest)
+        n_all = len(train_ex)
+        train_ex = [e for e in train_ex if fits(e, args.enroll_max, args.gap)]
+        if args.max_train_examples:
+            train_ex = train_ex[: args.max_train_examples]
+        pool = None
+        if args.speaker_pool and not args.no_random_enrollment:
+            with open(args.speaker_pool) as f:
+                pool = json.load(f)
+        train_ds = ManifestDataset(train_ex, fe, tokens, train_cfg, augmenter=augmenter, speaker_pool=pool)
+    else:
+        utts = [u for path in args.train_index for u in read_index(path)]
+        n_all = len(utts)
+        probs = {int(k): float(v) for k, v in (x.split(":") for x in args.n_src_probs.split(","))}
+        train_ds = OnTheFlyMixDataset(utts, fe, tokens, train_cfg, n_src_probs=probs, overlap=args.overlap,
+                                      samples_per_epoch=args.max_train_examples or args.samples_per_epoch,
+                                      max_mix_sec=max_mix, augmenter=augmenter)
+        train_ex = train_ds
     sampler = EpochSampler(len(train_ds), args.seed, rank, world)
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, collate_fn=collate,
                           num_workers=args.num_workers, pin_memory=device.type == "cuda", drop_last=True)
 
     dev_ex = [e for e in read_manifest(args.dev_manifest) if fits(e, args.dev_enroll_dur, args.gap)]
     dev_ex = subset(dev_ex, args.dev_subset, seed=0)
-    dev_cfg = DataConfig(conditioning=args.conditioning, gap_sec=args.gap, train=False,
+    dev_cfg = DataConfig(conditioning=args.conditioning, gap_sec=args.gap, position=args.position, train=False,
                          enroll_mode="target", enroll_dur=args.dev_enroll_dur)
-    dev_dl = DataLoader(TSASRDataset(dev_ex, fe, tokens, dev_cfg), batch_size=args.dev_batch_size,
+    dev_dl = DataLoader(ManifestDataset(dev_ex, fe, tokens, dev_cfg), batch_size=args.dev_batch_size,
                         shuffle=False, collate_fn=collate, num_workers=min(args.num_workers, 4))
-    log({"event": "data", "train_examples": len(train_ex), "train_before_filter": n_all,
-         "dev_examples": len(dev_ex), "world": world})
+    log({"event": "data", "train_examples": len(train_ds), "train_pool": n_all, "max_mixture_sec": round(max_mix, 2),
+         "source": "manifest" if args.train_manifest else "on-the-fly", "dev_examples": len(dev_ex), "world": world})
 
     # ---------------------------------------------------------------- model
     spk_enc = SpeakerEncoder(args.spk_encoder).to(device) if args.conditioning == "spk_emb" else None
@@ -185,7 +214,9 @@ def main():
                       lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
                       lora_targets=args.lora_targets.split(","),
                       spk_dim=spk_enc.dim if spk_enc is not None else 512,
-                      spk_encoder=args.spk_encoder).to(device)
+                      spk_encoder=args.spk_encoder, separator=args.separator, full_ft=args.full_ft).to(device)
+    # data settings the evaluator must reuse
+    model.cfg["train_data"] = {"gap": args.gap, "position": args.position, "enroll_len": args.enroll_max}
     model.whisper.config.use_cache = False
     if args.grad_ckpt:
         model.whisper.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})

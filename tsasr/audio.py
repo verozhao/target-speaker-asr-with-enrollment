@@ -14,8 +14,16 @@ from . import ENC_HOP, SAMPLE_RATE
 EPS = 1e-8
 
 
-def load_audio(path: str, sr: int = SAMPLE_RATE, channel: int = 0) -> np.ndarray:
-    x, fs = sf.read(path, dtype="float32", always_2d=True)
+def load_audio(path: str, sr: int = SAMPLE_RATE, channel: int = 0,
+               start: Optional[float] = None, end: Optional[float] = None) -> np.ndarray:
+    """Mono float32 at `sr`. start/end (seconds) read only that segment."""
+    if start is None and end is None:
+        x, fs = sf.read(path, dtype="float32", always_2d=True)
+    else:
+        fs = sf.info(path).samplerate
+        a = int(round((start or 0.0) * fs))
+        b = None if end is None else int(round(end * fs))
+        x, fs = sf.read(path, dtype="float32", always_2d=True, start=a, stop=b)
     x = x[:, min(channel, x.shape[1] - 1)]
     if fs != sr:
         g = gcd(fs, sr)
@@ -104,21 +112,50 @@ def crop(x: np.ndarray, dur_sec: Optional[float], rng: Optional[np.random.Genera
     return x[off: off + n]
 
 
+def _pad_to_frame(n: int, hop: int = ENC_HOP) -> int:
+    return n + (-n) % hop
+
+
+def compose_input(enroll: Optional[np.ndarray], mixture: np.ndarray, gap_sec: float = 0.5,
+                  position: str = "prefix", lead_sec: float = 0.0, sr: int = SAMPLE_RATE,
+                  hop: int = ENC_HOP):
+    """Build the encoder input and the encoder-frame spans of its parts.
+
+    prefix: [lead | enrollment | separator | mixture]
+    suffix: [lead | mixture | separator | enrollment]
+    Every part after the first starts on an encoder frame boundary (20 ms); the
+    separator (silence of gap_sec) absorbs the alignment padding.
+
+    Returns (waveform, spans) with spans = {"enroll": (s, e), "sep": (s, e), "mix": (s, e)}
+    in encoder frames. Without an enrollment the input is [lead | mixture]."""
+    lead = _pad_to_frame(int(round(lead_sec * sr)), hop) if lead_sec > 0 else 0
+    z = lambda n: np.zeros(n, dtype=np.float32)  # noqa: E731
+    if enroll is None or len(enroll) == 0:
+        wav = np.concatenate([z(lead), mixture]).astype(np.float32)
+        m0 = lead // hop
+        return wav, {"enroll": (0, 0), "sep": (0, 0), "mix": (m0, m0 + len(mixture) // hop)}
+    gap = int(round(gap_sec * sr))
+    first = enroll if position == "prefix" else mixture
+    second = mixture if position == "prefix" else enroll
+    gap = _pad_to_frame(len(first) + gap, hop) - len(first)
+    wav = np.concatenate([z(lead), first, z(gap), second]).astype(np.float32)
+    f0 = lead // hop
+    first_full = f0 + len(first) // hop          # frames fully inside the first part
+    s0 = (lead + len(first) + gap) // hop        # start of the second part
+    first_span, second_span = (f0, first_full), (s0, s0 + len(second) // hop)
+    spans = {"sep": (first_full, s0)}
+    if position == "prefix":
+        spans.update(enroll=first_span, mix=second_span)
+    else:
+        spans.update(mix=(f0, f0 + len(first) // hop), enroll=second_span)
+    return wav, spans
+
+
 def compose_prefix(enroll: Optional[np.ndarray], mixture: np.ndarray, gap_sec: float = 0.5,
                    sr: int = SAMPLE_RATE, hop: int = ENC_HOP) -> Tuple[np.ndarray, int, int]:
-    """[enrollment | silence gap | mixture]. The gap is extended so that the mixture
-    starts exactly on an encoder frame boundary.
-
-    Returns (waveform, n_enroll_frames, mix_offset_frames)."""
-    if enroll is None or len(enroll) == 0:
-        return mixture.astype(np.float32), 0, 0
-    gap = int(round(gap_sec * sr))
-    pre = len(enroll) + gap
-    gap += (-pre) % hop
-    wav = np.concatenate([enroll, np.zeros(gap, dtype=np.float32), mixture]).astype(np.float32)
-    n_enroll_frames = len(enroll) // hop
-    mix_offset = (len(enroll) + gap) // hop
-    return wav, n_enroll_frames, mix_offset
+    """[enrollment | silence gap | mixture]. Returns (waveform, n_enroll_frames, mix_offset_frames)."""
+    wav, sp = compose_input(enroll, mixture, gap_sec, "prefix", 0.0, sr, hop)
+    return wav, sp["enroll"][1] - sp["enroll"][0], sp["mix"][0]
 
 
 def add_noise(x: np.ndarray, noise: np.ndarray, snr_db: float,

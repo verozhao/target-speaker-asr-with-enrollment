@@ -2,9 +2,12 @@
 """DiCoW baseline (BUT-FIT/DiCoW_v3_2, Whisper large-v3-turbo) with ORACLE diarization.
 
 DiCoW conditions on a silence/target/non-target/overlap (STNO) mask instead of an
-enrollment. The mask is built from the Libri2Mix/Libri3Mix source signals
-(frame energy at 50 Hz, pauses < 200 ms closed), so this baseline gets perfect
-diarization, which none of our systems use.
+enrollment. Oracle masks come from the clean sources on LibriMix (frame energy at
+50 Hz, pauses < 200 ms closed) and from the word timings on AMI (the manifest's
+"activity" field), so this baseline gets perfect diarization, which none of our
+systems use. Note: the v3.2 model card lists Libri2Mix and AMI among its training
+data, so neither test set is out of domain for it. The paper version is DiCoW_v1,
+which needs the code from the v1 branch of the DiCoW GitHub repo.
 
 The STNO construction copies get_stno_mask from BUTSpeechFIT/DiCoW pipeline.py
 (class order 0 silence, 1 target, 2 non-target, 3 overlap). DiCoW's remote code
@@ -47,13 +50,26 @@ def oracle_stno(sources, target):
     return stno_from_activity(full, target)  # frames after the mixture end -> silence
 
 
+def stno_from_segments(activity, target):
+    """activity: per speaker list of (start, end) seconds relative to the window."""
+    full = []
+    for segs in activity:
+        f = np.zeros(WHISPER_ENC_FRAMES, dtype=bool)
+        for s, e in segs:
+            f[max(int(round(s * 50)), 0): min(int(round(e * 50)), WHISPER_ENC_FRAMES)] = True
+        full.append(f)
+    if len(full) == 1:
+        full.append(np.zeros(WHISPER_ENC_FRAMES, dtype=bool))
+    return stno_from_activity(full, target)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--manifest", required=True)
     p.add_argument("--out-dir", required=True)
     p.add_argument("--model", default="BUT-FIT/DiCoW_v3_2")
-    p.add_argument("--revision", default=DICOW_REVISION)
-    p.add_argument("--fit-dur", type=float, default=10.0, help="same subset as evaluate.py")
+    p.add_argument("--revision", default=None, help="default: pinned commit for v3_2, main otherwise")
+    p.add_argument("--fit-dur", type=float, default=5.0, help="same subset as evaluate.py")
     p.add_argument("--gap", type=float, default=0.5)
     p.add_argument("--condition", default="clean", choices=["clean", "mix_perturbed"])
     p.add_argument("--noise-list", default=None)
@@ -66,6 +82,8 @@ def main():
     p.add_argument("--max-examples", type=int, default=None)
     p.add_argument("--tag", default=None)
     a = p.parse_args()
+    if a.revision is None:
+        a.revision = DICOW_REVISION if a.model == "BUT-FIT/DiCoW_v3_2" else "main"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16 if (a.fp16 and device.type == "cuda") else torch.float32
@@ -87,13 +105,17 @@ def main():
         chunk = ex[i: i + a.batch_size]
         feats, masks = [], []
         for e in chunk:
-            mix = load_audio(e["mixture"])
+            start, end = e.get("mixture_span") or (None, None)
+            mix = load_audio(e["mixture"], start=start, end=end)
             if pert is not None:
                 _, mix = pert(None, mix, e["id"])
             mix = mix[:WHISPER_WINDOW_SAMPLES]
             feats.append(fe(mix, sampling_rate=SAMPLE_RATE, return_tensors="pt").input_features[0])
-            srcs = [load_audio(s) for s in e["sources"]]
-            masks.append(torch.from_numpy(oracle_stno(srcs, e["target_index"])))
+            if e.get("sources"):
+                srcs = [load_audio(s) for s in e["sources"]]
+                masks.append(torch.from_numpy(oracle_stno(srcs, e["target_index"])))
+            else:  # AMI: activity[0] is the target
+                masks.append(torch.from_numpy(stno_from_segments(e["activity"], 0)))
         feats = torch.stack(feats).to(device, dtype)
         stno = torch.stack(masks).to(device, dtype)
         assert feats.shape[-1] == 2 * stno.shape[-1] == 3000, (feats.shape, stno.shape)

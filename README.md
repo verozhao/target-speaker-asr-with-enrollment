@@ -53,6 +53,7 @@ NOTSOFAR (AMI is the real-data set).
 | `scripts/eval_dicow.py` | DiCoW v3.2 with oracle diarization masks |
 | `scripts/summarize.py` | one Markdown table of every result |
 | `scripts/run.sh` | stage driver with the exact command of every experiment |
+| `scripts/run_layout_experiments.sh`, `scripts/layout_table.py` | enrollment-layout experiments (padding / anchored / fixed 5 s) and their results matrix, see `docs/layout_experiments.md` |
 | `slurm/*.sbatch` | SLURM wrappers (one GPU, multi-GPU) |
 | `tools/make_toy_librimix.py` | macOS toy corpus for a laptop smoke test |
 
@@ -89,6 +90,10 @@ bash scripts/run.sh summarize                                  # results/table.m
 Variants: `train_learned_sep`, `train_fullft`, `train_len_ablation` (random 1-10 s
 enrollment), `train_aug`, `train_aux`, `eval_perturbed`. `TRAIN_SOURCE=libri2mix`
 trains on the pre-built Libri2Mix train-100 set instead of LibriSpeech 960.
+
+Enrollment-layout experiments (random 1-10 s enrollment with padding, random enrollment
+with the mixture anchored at 10.5 s, fixed 5 s, all on identical mixtures) have their own
+driver and instructions in [docs/layout_experiments.md](docs/layout_experiments.md).
 
 Training resumes from `<out-dir>/last` when the same command is re-run, so a job that
 hits the time limit can be resubmitted. Multi-GPU:

@@ -249,3 +249,54 @@ def test_dicow_masks_from_segments():
     assert st[1, 25] == 1 and st[3, 75] == 1 and st[2, 125] == 1 and st[0, 175] == 1
     solo = stno_from_segments([[(0.0, 1.0)]], 0)  # target alone in the window
     assert solo[1, 10] == 1 and solo[2].sum() == 0
+
+
+class _StubFE:
+    def __call__(self, wav, sampling_rate, return_tensors):
+        class R:
+            input_features = np.zeros((1, 80, 3000), np.float32)
+        self.last_len = len(wav)
+        return R()
+
+
+class _StubTokens:
+    def build(self, text):
+        return [1, 2], [3, 4]
+
+
+def _layout_item(enroll_sec, mix_start=None, mode_none=False):
+    from tsasr.data import DataConfig, _Base
+
+    ds = _Base(_StubFE(), _StubTokens(), DataConfig(gap_sec=0.5, mix_start=mix_start))
+    enr = None if mode_none else tone(enroll_sec)
+    item = ds._finish("m__s1", tone(9.5), None, 0, ["a"], enr, np.random.default_rng(0))
+    return item, ds.fe.last_len
+
+
+def test_anchored_layout_keeps_mixture_position():
+    for L in (1, 2, 5, 10):
+        item, n = _layout_item(L, mix_start=10.5)
+        assert item["mix_offset"] == 525  # 10.5 s at 50 frames/s
+        assert item["enroll_span"] == (0, L * 50) and item["sep_span"] == (L * 50, 525)
+        assert n == int(20.0 * SAMPLE_RATE)  # 10.5 s + the 9.5 s mixture = the 20 s input
+    item, _ = _layout_item(5, mix_start=10.5, mode_none=True)
+    assert item["mix_offset"] == 525 and item["enroll_span"] == (0, 0)
+
+
+def test_padding_layout_moves_mixture():
+    for L in (1, 2, 5, 10):
+        item, n = _layout_item(L)
+        assert item["mix_offset"] == L * 50 + 25  # enrollment + 0.5 s separator
+        assert n == int((L + 0.5 + 9.5) * SAMPLE_RATE)
+
+
+def test_enroll_choices_respect_room():
+    from tsasr.data import DataConfig, _Base
+
+    rng = np.random.default_rng(0)
+    ds = _Base(None, None, DataConfig(train=True, enroll_choices=(1, 2, 5, 10), mix_start=10.5))
+    assert {ds._enroll_len(19.0, rng) for _ in range(200)} == {1.0, 2.0, 5.0, 10.0}
+    ds = _Base(None, None, DataConfig(train=True, enroll_choices=(1, 2, 5, 10)))
+    assert {ds._enroll_len(25.0, rng) for _ in range(200)} <= {1.0, 2.0}  # 30 - 25 - 0.5 leaves < 5 s
+    ds = _Base(None, None, DataConfig(train=True, enroll_min=1, enroll_max=10, mix_start=10.5))
+    assert all(1.0 <= ds._enroll_len(19.0, rng) <= 10.0 for _ in range(200))

@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -45,14 +45,19 @@ def read_manifest(path: str) -> List[dict]:
         return [json.loads(ln) for ln in f if ln.strip()]
 
 
-def max_mixture_sec(enroll_sec: float, gap_sec: float, lead_sec: float = 0.0) -> float:
-    """Longest mixture that fits in 30 s next to the enrollment, separator and lead."""
+def max_mixture_sec(enroll_sec: float, gap_sec: float, lead_sec: float = 0.0,
+                    mix_start: Optional[float] = None) -> float:
+    """Longest mixture that fits in 30 s next to the enrollment, separator and lead.
+    With mix_start (anchored layout) the mixture always starts at mix_start seconds."""
+    if mix_start is not None:
+        return WHISPER_WINDOW_SEC - mix_start - SLACK
     slack = SLACK * (2 if lead_sec > 0 else 1)
     return WHISPER_WINDOW_SEC - enroll_sec - gap_sec - lead_sec - slack
 
 
-def fits(ex: dict, enroll_sec: float, gap_sec: float, lead_sec: float = 0.0) -> bool:
-    return ex["duration"] <= max_mixture_sec(enroll_sec, gap_sec, lead_sec) + 1e-9
+def fits(ex: dict, enroll_sec: float, gap_sec: float, lead_sec: float = 0.0,
+         mix_start: Optional[float] = None) -> bool:
+    return ex["duration"] <= max_mixture_sec(enroll_sec, gap_sec, lead_sec, mix_start) + 1e-9
 
 
 class Tokens:
@@ -82,10 +87,14 @@ class DataConfig:
     position: str = "prefix"            # prefix | suffix (enrollment before / after the mixture)
     lead_sec: float = 0.0               # silence before everything (positional-embedding tests)
     random_lead: bool = False           # train: random lead within the free part of the window
+    mix_start: Optional[float] = None   # anchored layout: the mixture always starts here (s) and
+                                        # the separator fills the time after the enrollment
+                                        # (gap_sec is then the minimum separator)
     # training enrollment
     train: bool = False
     enroll_min: float = 5.0
     enroll_max: float = 5.0
+    enroll_choices: Optional[Tuple[float, ...]] = None  # train: draw the length from these values
     random_enrollment: bool = True      # draw a new utterance of the target speaker every epoch
     # evaluation enrollment
     enroll_mode: str = "target"         # target | interferer | other | silence | none
@@ -112,13 +121,24 @@ class _Base(Dataset):
     def _rng(self, i):
         return np.random.default_rng([self.cfg.seed, self.epoch, i])
 
+    def _enroll_room(self, mix_sec: float) -> float:
+        """Longest enrollment that still fits with this mixture."""
+        c = self.cfg
+        if c.conditioning != "prefix":
+            return float("inf")
+        if c.mix_start is not None:
+            return c.mix_start - c.gap_sec
+        return WHISPER_WINDOW_SEC - mix_sec - c.gap_sec - 2 * SLACK
+
     def _enroll_len(self, mix_sec: float, rng) -> Optional[float]:
         c = self.cfg
         if not c.train:
             return c.enroll_dur
-        hi = c.enroll_max
-        if c.conditioning == "prefix":
-            hi = min(hi, WHISPER_WINDOW_SEC - mix_sec - c.gap_sec - 2 * SLACK)
+        room = self._enroll_room(mix_sec)
+        if c.enroll_choices:
+            ok = [x for x in c.enroll_choices if x <= room + 1e-9]
+            return float(rng.choice(ok)) if ok else room
+        hi = min(c.enroll_max, room)
         lo = min(c.enroll_min, hi)
         return float(rng.uniform(lo, hi)) if hi > lo else hi
 
@@ -137,11 +157,18 @@ class _Base(Dataset):
             enroll = rms_normalize(enroll)
 
         use_enroll = c.conditioning == "prefix" and enroll is not None
-        lead = c.lead_sec
-        if c.train and c.random_lead:
-            used = len(mixture) / SAMPLE_RATE + ((len(enroll) / SAMPLE_RATE + c.gap_sec) if use_enroll else 0.0)
+        lead, gap = c.lead_sec, c.gap_sec
+        if c.mix_start is not None:
+            # anchored layout: [enrollment | silence up to mix_start | mixture]
+            if use_enroll:
+                enroll = enroll[: int(round((c.mix_start - c.gap_sec) * SAMPLE_RATE))]
+                gap = c.mix_start - len(enroll) / SAMPLE_RATE
+            else:  # no enrollment: keep the mixture at the same position
+                lead = c.mix_start
+        elif c.train and c.random_lead:
+            used = len(mixture) / SAMPLE_RATE + ((len(enroll) / SAMPLE_RATE + gap) if use_enroll else 0.0)
             lead = float(rng.uniform(0.0, max(WHISPER_WINDOW_SEC - used - 3 * SLACK, 0.0)))
-        wav, spans = compose_input(enroll if use_enroll else None, mixture, c.gap_sec, c.position, lead)
+        wav, spans = compose_input(enroll if use_enroll else None, mixture, gap, c.position, lead)
         if len(wav) > WHISPER_WINDOW_SAMPLES:
             wav = wav[:WHISPER_WINDOW_SAMPLES]
         feats = self.fe(wav, sampling_rate=SAMPLE_RATE, return_tensors="np").input_features[0]

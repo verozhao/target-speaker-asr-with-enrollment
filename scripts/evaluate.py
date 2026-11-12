@@ -59,6 +59,8 @@ def parse_args():
     p.add_argument("--gap", type=float, default=None, help="default: the checkpoint's training gap (0.5 s)")
     p.add_argument("--position", default=None, choices=["prefix", "suffix"], help="default: as trained")
     p.add_argument("--lead-sec", type=float, default=0.0, help="silence before the input (position test)")
+    p.add_argument("--mix-start", type=float, default=None,
+                   help="anchored layout (mixture starts at this second); default: as trained")
     p.add_argument("--text-prompt", default=None, help="Whisper previous-text prompt")
     p.add_argument("--condition", default="clean", choices=EVAL_CONDITIONS)
     p.add_argument("--noise-list", default=None, help="test-split noise list")
@@ -115,6 +117,7 @@ def main():
         model_name, system = a.model, a.system
     gap = a.gap if a.gap is not None else trained.get("gap", 0.5)
     position = a.position or trained.get("position", "prefix")
+    mix_start = a.mix_start if a.mix_start is not None else trained.get("mix_start")
     model.to(device).eval()
     model.whisper.config.use_cache = True
 
@@ -123,7 +126,8 @@ def main():
     tokens = Tokens(tok)
 
     all_ex = read_manifest(a.manifest)
-    ex = [e for e in all_ex if fits(e, a.fit_dur, gap, a.lead_sec) and all(e.get(k) for k in a.require_key)]
+    ex = [e for e in all_ex
+          if fits(e, a.fit_dur, gap, a.lead_sec, mix_start) and all(e.get(k) for k in a.require_key)]
     if a.enroll_mode == "interferer":
         ex = attach_interferer(ex)
     elif a.enroll_mode in ("target", "silence"):
@@ -136,7 +140,7 @@ def main():
         perturber = EvalPerturber(a.noise_list, a.rir_list, a.condition, a.snr,
                                   reverb=not a.no_reverb, noise=not a.no_noise)
     cfg = DataConfig(conditioning=conditioning, input_kind=input_kind, gap_sec=gap, position=position,
-                     lead_sec=a.lead_sec, train=False, enroll_mode=a.enroll_mode, enroll_field=a.enroll_field,
+                     lead_sec=a.lead_sec, mix_start=mix_start, train=False, enroll_mode=a.enroll_mode, enroll_field=a.enroll_field,
                      enroll_dur=a.enroll_dur)
     ds = ManifestDataset(ex, fe, tokens, cfg, perturber=perturber)
     dl = DataLoader(ds, batch_size=a.batch_size, shuffle=False, collate_fn=Collator(tokens.pad),
@@ -161,6 +165,8 @@ def main():
         parts.append(a.position)
     if a.lead_sec:
         parts.append(f"lead{a.lead_sec:g}")
+    if a.mix_start is not None and a.mix_start != trained.get("mix_start"):
+        parts.append(f"start{a.mix_start:g}")
     if a.text_prompt:
         parts.append("textprompt")
     if a.num_beams > 1:
@@ -168,7 +174,8 @@ def main():
     tag = a.tag or "_".join(parts)
     summ.update({"system": system, "manifest": a.manifest, "condition": a.condition, "enroll_dur": a.enroll_dur,
                  "enroll_field": a.enroll_field, "fit_dur": a.fit_dur, "gap": gap, "position": position,
-                 "lead_sec": a.lead_sec, "text_prompt": a.text_prompt, "require_key": a.require_key,
+                 "lead_sec": a.lead_sec, "mix_start": mix_start, "text_prompt": a.text_prompt,
+                 "require_key": a.require_key,
                  "n_manifest": len(all_ex),
                  "n_scored": len(recs), "num_beams": a.num_beams, "snr": a.snr if a.condition != "clean" else None,
                  "reverb": (not a.no_reverb) if a.condition != "clean" else None,

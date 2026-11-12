@@ -63,8 +63,13 @@ def parse_args():
     p.add_argument("--snr-min", type=float, default=0.0)
     p.add_argument("--snr-max", type=float, default=20.0)
     # enrollment
-    p.add_argument("--enroll-min", type=float, default=5.0, help="5/5 = fixed 5 s (spec); 1/10 = random-length ablation")
+    p.add_argument("--enroll-min", type=float, default=5.0, help="5/5 = fixed 5 s (spec); 1/10 = random length")
     p.add_argument("--enroll-max", type=float, default=5.0)
+    p.add_argument("--enroll-choices", default=None, help="draw the length from a list instead, e.g. 1,2,5,10")
+    p.add_argument("--mix-start", type=float, default=None,
+                   help="anchored layout: mixture always starts at this second, silence fills after the enrollment")
+    p.add_argument("--max-mix-sec", type=float, default=None,
+                   help="mixture length cap; give every run of a comparison the same value to train on identical mixtures")
     p.add_argument("--gap", type=float, default=None, help="separator seconds (default 0.5 silence, 0.02 learned)")
     p.add_argument("--no-random-enrollment", action="store_true")
     # LoRA
@@ -87,7 +92,7 @@ def parse_args():
     # eval / logging
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--dev-subset", type=int, default=500)
-    p.add_argument("--dev-enroll-dur", type=float, default=None, help="default: --enroll-max")
+    p.add_argument("--dev-enroll-dur", type=float, default=5.0, help="enrollment length of the dev evaluation")
     p.add_argument("--dev-batch-size", type=int, default=16)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
@@ -95,8 +100,14 @@ def parse_args():
     a = p.parse_args()
     if a.gap is None:
         a.gap = 0.02 if a.separator == "learned" else 0.5
-    if a.dev_enroll_dur is None:
-        a.dev_enroll_dur = a.enroll_max
+    a.enroll_choices = tuple(float(x) for x in a.enroll_choices.split(",")) if a.enroll_choices else None
+    if a.enroll_choices:
+        a.enroll_min, a.enroll_max = min(a.enroll_choices), max(a.enroll_choices)
+    if a.mix_start is not None:
+        if a.position != "prefix":
+            raise SystemExit("--mix-start needs --position prefix")
+        if a.enroll_max > a.mix_start - a.gap + 1e-9:
+            raise SystemExit("--mix-start must leave room for the longest enrollment plus --gap")
     return a
 
 
@@ -170,16 +181,16 @@ def main():
     augmenter = Augmenter(args.noise_list, args.rir_list, args.aug, args.p_noise, args.p_rir,
                           (args.snr_min, args.snr_max)) if args.aug != "none" else None
     train_cfg = DataConfig(conditioning=args.conditioning, gap_sec=args.gap, position=args.position,
-                           random_lead=args.random_lead, train=True,
-                           enroll_min=args.enroll_min, enroll_max=args.enroll_max,
+                           random_lead=args.random_lead, mix_start=args.mix_start, train=True,
+                           enroll_min=args.enroll_min, enroll_max=args.enroll_max, enroll_choices=args.enroll_choices,
                            random_enrollment=not args.no_random_enrollment,
                            frame_labels=args.aux != "none", seed=args.seed)
     # every system trains on the same mixtures: those that fit next to the longest enrollment
-    max_mix = max_mixture_sec(args.enroll_max, args.gap)
+    max_mix = args.max_mix_sec or max_mixture_sec(args.enroll_max, args.gap, mix_start=args.mix_start)
     if args.train_manifest:
         train_ex = read_manifest(args.train_manifest)
         n_all = len(train_ex)
-        train_ex = [e for e in train_ex if fits(e, args.enroll_max, args.gap)]
+        train_ex = [e for e in train_ex if e["duration"] <= max_mix + 1e-9]
         if args.max_train_examples:
             train_ex = train_ex[: args.max_train_examples]
         pool = None
@@ -199,10 +210,11 @@ def main():
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, collate_fn=collate,
                           num_workers=args.num_workers, pin_memory=device.type == "cuda", drop_last=True)
 
-    dev_ex = [e for e in read_manifest(args.dev_manifest) if fits(e, args.dev_enroll_dur, args.gap)]
+    dev_ex = [e for e in read_manifest(args.dev_manifest)
+              if fits(e, args.dev_enroll_dur, args.gap, mix_start=args.mix_start)]
     dev_ex = subset(dev_ex, args.dev_subset, seed=0)
-    dev_cfg = DataConfig(conditioning=args.conditioning, gap_sec=args.gap, position=args.position, train=False,
-                         enroll_mode="target", enroll_dur=args.dev_enroll_dur)
+    dev_cfg = DataConfig(conditioning=args.conditioning, gap_sec=args.gap, position=args.position,
+                         mix_start=args.mix_start, train=False, enroll_mode="target", enroll_dur=args.dev_enroll_dur)
     dev_dl = DataLoader(ManifestDataset(dev_ex, fe, tokens, dev_cfg), batch_size=args.dev_batch_size,
                         shuffle=False, collate_fn=collate, num_workers=min(args.num_workers, 4))
     log({"event": "data", "train_examples": len(train_ds), "train_pool": n_all, "max_mixture_sec": round(max_mix, 2),
@@ -216,7 +228,9 @@ def main():
                       spk_dim=spk_enc.dim if spk_enc is not None else 512,
                       spk_encoder=args.spk_encoder, separator=args.separator, full_ft=args.full_ft).to(device)
     # data settings the evaluator must reuse
-    model.cfg["train_data"] = {"gap": args.gap, "position": args.position, "enroll_len": args.enroll_max}
+    model.cfg["train_data"] = {"gap": args.gap, "position": args.position, "mix_start": args.mix_start,
+                               "enroll_min": args.enroll_min, "enroll_max": args.enroll_max,
+                               "enroll_choices": args.enroll_choices, "max_mix_sec": round(max_mix, 3)}
     model.whisper.config.use_cache = False
     if args.grad_ckpt:
         model.whisper.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})

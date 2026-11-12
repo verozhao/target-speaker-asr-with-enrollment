@@ -9,7 +9,8 @@ who talks inside it. Reference = the target's words inside the window.
 Enrollment (all from the same microphone, nobody else talking):
   enrollment                 same session, outside the window
   enrollment_other_session   another session of the same person (global speaker id)
-  interferer_enrollment      the most active other speaker of the window, same session
+  interferer_enrollment      the most active other speaker of the window (at least
+                             --min-words words inside it), same session
   other_enrollment           a person who is not in this session
 
   python scripts/prepare_ami.py --annotations $S/ami/annotations --audio-dir $S/ami/audio \
@@ -97,7 +98,8 @@ def main():
                 if other_sess:
                     s2 = sorted(other_sess, key=lambda s: _h(key, s))[0]
                     rec["enrollment_other_session"] = enrollment(s2, spk, key + "|xs")
-                if others:
+                # swap test only when the interferer says enough inside the window to be scored
+                if others and len(inside[others[0]]) >= a.min_words:
                     rec["interferer_enrollment"] = enrollment(sess, others[0], key + "|int", (st, en))
                     if rec["interferer_enrollment"] is not None:
                         rec["interferer_index"] = 1

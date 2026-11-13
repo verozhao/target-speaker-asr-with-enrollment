@@ -4,6 +4,8 @@
 # with the official LibriMix metadata and script.
 # WITH_960=1 (default) also downloads train-clean-360 and train-other-500 so that
 # training mixtures can be made on the fly from all of LibriSpeech 960.
+# WITH_L2M_TRAIN=0 skips generating Libri2Mix train-100 (~33 GB), which is only needed
+# for TRAIN_SOURCE=libri2mix; dev/test and Libri3Mix test are always generated.
 #
 # Usage: bash scripts/get_data.sh /path/to/storage
 # Needs ~120 GB free (+ ~60 GB for the 960 h subsets). LibriMix deps: soundfile pandas numpy scipy tqdm.
@@ -58,7 +60,10 @@ gen() {  # n_src, splits...
     --n_src "$n" --freqs 16k --modes max --types mix_clean mix_both
 }
 
-[ -d Libri2Mix/wav16k/max/test ] || gen 2 train-clean-100 dev-clean test-clean
+L2_SPLITS="dev-clean test-clean"
+[ "${WITH_L2M_TRAIN:-1}" = "1" ] && L2_SPLITS="train-clean-100 $L2_SPLITS"
+# shellcheck disable=SC2086
+[ -d Libri2Mix/wav16k/max/test ] || gen 2 $L2_SPLITS
 [ -d Libri3Mix/wav16k/max/test ] || gen 3 test-clean
 
 echo "done. Libri2Mix at $STORAGE/Libri2Mix/wav16k/max, Libri3Mix at $STORAGE/Libri3Mix/wav16k/max"

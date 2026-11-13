@@ -4,8 +4,7 @@ __pycache__/
 data/
 exp/
 results/
-logs/*
-!logs/.gitkeep
+logs/
 *.wav
 *.flac
 report/

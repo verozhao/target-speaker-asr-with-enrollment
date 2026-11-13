@@ -70,7 +70,6 @@ echo 'STORAGE=/path/with/200GB/free' > config.local.sh
 ```
 
 Run from the repository root. `config.sh` activates `.venv` when it exists.
-On NCSA Delta, follow [docs/delta.md](docs/delta.md) (account, paths, `slurm/delta.sbatch`, storage budget).
 
 ## Run order
 

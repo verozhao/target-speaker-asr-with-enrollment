@@ -71,7 +71,6 @@ case "${1:?stage}" in
     bash scripts/get_ami.sh "$STORAGE" test ;;
   prep)
     for s in train-100 dev test; do
-      if [ ! -f "$L2/metadata/mixture_${s}_mix_clean.csv" ]; then echo "skip Libri2Mix $s (not generated)"; continue; fi
       python scripts/prepare_manifests.py --librispeech-dir "$STORAGE/LibriSpeech" --librimix-dir "$L2" \
         --n-src 2 --split "$s" --out-dir "$DATA"
     done

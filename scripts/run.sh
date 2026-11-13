@@ -4,6 +4,7 @@
 #   sbatch slurm/job.sbatch bash scripts/run.sh train_prefix
 #   sbatch slurm/job.sbatch bash scripts/run.sh eval exp/prefix/best
 #
+# Setup:     prefetch (download every model once, on a login node; jobs can then run offline)
 # Data:      data, prep
 # Training:  train_prefix (ours) | train_none (no conditioning) | train_spk (WavLM x-vector)
 #            train_spk_titanet | train_learned_sep | train_fullft | train_len_ablation | train_wavlm
@@ -66,6 +67,8 @@ eval_ckpt() {  # the required analyses for one trained model
 }
 
 case "${1:?stage}" in
+  prefetch)
+    python scripts/prefetch_models.py --model "$MODEL" ;;
   data)
     bash scripts/get_data.sh "$STORAGE"
     bash scripts/get_ami.sh "$STORAGE" test ;;

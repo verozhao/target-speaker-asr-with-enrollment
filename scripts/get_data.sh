@@ -6,6 +6,8 @@
 # training mixtures can be made on the fly from all of LibriSpeech 960.
 #
 # Usage: bash scripts/get_data.sh /path/to/storage
+#        STEP=download bash scripts/get_data.sh ...   only download/extract (e.g. on a login node)
+#        STEP=generate bash scripts/get_data.sh ...   only generate LibriMix (as a job)
 # Needs ~120 GB free (+ ~60 GB for the 960 h subsets). LibriMix deps: soundfile pandas numpy scipy tqdm.
 set -euo pipefail
 
@@ -17,6 +19,8 @@ fetch() {  # url
   wget -c --tries=0 --read-timeout=20 "$1" -P "$STORAGE"
 }
 
+STEP=${STEP:-all}
+if [ "$STEP" != "generate" ]; then
 SUBSETS="train-clean-100 dev-clean test-clean"
 [ "${WITH_960:-1}" = "1" ] && SUBSETS="$SUBSETS train-clean-360 train-other-500"
 for s in $SUBSETS; do
@@ -38,6 +42,8 @@ fi
 
 [ -d LibriMix ] || git clone https://github.com/JorisCos/LibriMix.git
 git -C LibriMix rev-parse HEAD > librimix_commit.txt
+fi
+[ "$STEP" = "download" ] && { echo "downloads done in $STORAGE"; exit 0; }
 
 # The LibriMix script processes every CSV in --metadata_dir whose name lacks
 # "info", so pass a copy that holds only the splits we use (no train-360).

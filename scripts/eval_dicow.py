@@ -29,13 +29,12 @@ import torch
 from tqdm import tqdm
 from transformers import AutoFeatureExtractor, AutoModelForSpeechSeq2Seq, AutoTokenizer
 
-from tsasr import SAMPLE_RATE, WHISPER_ENC_FRAMES, WHISPER_WINDOW_SAMPLES
+from tsasr import DICOW_MODEL, DICOW_REVISION, SAMPLE_RATE, WHISPER_ENC_FRAMES, WHISPER_WINDOW_SAMPLES
 from tsasr.audio import load_audio, smooth_activity, speech_activity, stno_from_activity
 from tsasr.augment import EvalPerturber
 from tsasr.data import fits, read_manifest
 from tsasr.evaluation import score, subset, write_jsonl
 
-DICOW_REVISION = "00a09c622bf58c34fdc76c3b5676f4da706f2a8e"
 _TS = re.compile(r"<\|[^|]*\|>")
 
 
@@ -67,7 +66,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--manifest", required=True)
     p.add_argument("--out-dir", required=True)
-    p.add_argument("--model", default="BUT-FIT/DiCoW_v3_2")
+    p.add_argument("--model", default=DICOW_MODEL)
     p.add_argument("--revision", default=None, help="default: pinned commit for v3_2, main otherwise")
     p.add_argument("--fit-dur", type=float, default=5.0, help="same subset as evaluate.py")
     p.add_argument("--gap", type=float, default=0.5)
@@ -83,7 +82,7 @@ def main():
     p.add_argument("--tag", default=None)
     a = p.parse_args()
     if a.revision is None:
-        a.revision = DICOW_REVISION if a.model == "BUT-FIT/DiCoW_v3_2" else "main"
+        a.revision = DICOW_REVISION if a.model == DICOW_MODEL else "main"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16 if (a.fp16 and device.type == "cuda") else torch.float32

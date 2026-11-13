@@ -76,7 +76,7 @@ def main():
     p.add_argument("--snr", type=float, default=5.0)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-beams", type=int, default=1)
-    p.add_argument("--language", default=None, help="e.g. en, passed to generate if set")
+    p.add_argument("--language", default="en", help="forced like our systems; 'none' lets DiCoW detect it")
     p.add_argument("--fp16", action="store_true")
     p.add_argument("--max-examples", type=int, default=None)
     p.add_argument("--tag", default=None)
@@ -97,7 +97,7 @@ def main():
     pert = EvalPerturber(a.noise_list, a.rir_list, a.condition, a.snr) if a.condition != "clean" else None
 
     gen_kw = {"num_beams": a.num_beams, "return_timestamps": True}
-    if a.language:
+    if a.language and a.language != "none":
         gen_kw["language"] = a.language
     hyps, t0 = {}, time.time()
     for i in tqdm(range(0, len(ex), a.batch_size), desc="dicow"):

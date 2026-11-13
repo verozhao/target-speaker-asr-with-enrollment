@@ -73,6 +73,7 @@ class TSWhisper(nn.Module):
         base.generation_config.forced_decoder_ids = None
         for p in base.parameters():
             p.requires_grad_(full_ft)
+        base.model.encoder.embed_positions.requires_grad_(False)  # fixed sinusoids, frozen in Whisper too
         if full_ft or not use_lora:
             self.peft, self.whisper = None, base
         elif adapter_dir is not None:
@@ -93,7 +94,8 @@ class TSWhisper(nn.Module):
         if frontend == "ssl":
             from transformers import AutoFeatureExtractor, AutoModel
 
-            self.ssl = AutoModel.from_pretrained(ssl_dir or ssl_model)
+            # no LayerDrop: skipped layers would leave parameters unused (breaks DDP) and add noise
+            self.ssl = AutoModel.from_pretrained(ssl_dir or ssl_model, layerdrop=0.0)
             self.ssl_fe = AutoFeatureExtractor.from_pretrained(ssl_dir or ssl_model)
             self.ssl_normalize = bool(getattr(self.ssl_fe, "do_normalize", False))
             self.ssl_use_mask = bool(getattr(self.ssl_fe, "return_attention_mask", True))
@@ -150,17 +152,26 @@ class TSWhisper(nn.Module):
             var = (((x - mu) * m) ** 2).sum(1, keepdim=True) / n
             x = (x - mu) / torch.sqrt(var + 1e-7) * m
         frozen = self.cfg["ssl_train"] == "frozen"
+        w = torch.softmax(self.ssl_layer_w, 0)
+        # GroupNorm models (wavlm-base, wavlm-base-plus) normalise the first CNN layer over the
+        # whole input, padding included, so they run one utterance at a time without padding.
+        per_item = getattr(self.ssl.config, "feat_extract_norm", "group") == "group"
         with torch.no_grad() if frozen else nullcontext():
-            out = self.ssl(x, attention_mask=wav_mask if self.ssl_use_mask else None, output_hidden_states=True)
-        hs = torch.stack(out.hidden_states, 0)  # (layers + 1, B, T, D)
-        w = torch.softmax(self.ssl_layer_w, 0).to(hs.dtype)
-        h = (w[:, None, None, None] * hs).sum(0)
-        B, T, D = h.shape
-        buf = h.new_zeros(B, n_pos, D)
-        for b in range(B):
+            if per_item:
+                outs = [self.ssl(x[b: b + 1, : int(wav_mask[b].sum())], output_hidden_states=True).hidden_states
+                        for b in range(x.shape[0])]
+            else:
+                outs = self.ssl(x, attention_mask=wav_mask if self.ssl_use_mask else None,
+                                output_hidden_states=True).hidden_states
+                outs = [tuple(h[b: b + 1] for h in outs) for b in range(x.shape[0])]
+        B, D = x.shape[0], self.ssl.config.hidden_size
+        buf = x.new_zeros(B, n_pos, D)
+        for b, hs in enumerate(outs):
+            hs = torch.stack(hs, 0)[:, 0]  # (layers + 1, T, D)
+            h = (w.to(hs.dtype)[:, None, None] * hs).sum(0)
             s = int(mix_offset[b])
-            n = max(min(int(mix_frames[b]), T - s, n_pos), 0)
-            buf[b, :n] = h[b, s: s + n]
+            n = max(min(int(mix_frames[b]), h.shape[0] - s, n_pos), 0)
+            buf[b, :n] = h[s: s + n].to(buf.dtype)
         return self.ssl_proj(buf).transpose(1, 2)
 
     def _dummy_features(self, ref: torch.Tensor):
@@ -231,6 +242,18 @@ class TSWhisper(nn.Module):
             self._clear_cond()
 
     # ----------------------------------------------------------------- io
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.frontend == "ssl" and self.cfg["ssl_train"] == "frozen":
+            self.ssl.eval()  # a frozen WavLM never uses dropout or SpecAugment
+        return self
+
+    def enable_gradient_checkpointing(self):
+        kw = {"gradient_checkpointing_kwargs": {"use_reentrant": False}}
+        self.whisper.gradient_checkpointing_enable(**kw)
+        if self.frontend == "ssl" and self.cfg["ssl_train"] == "full":
+            self.ssl.gradient_checkpointing_enable(**kw)
+
     def trainable_parameters(self):
         return [p for p in self.parameters() if p.requires_grad]
 

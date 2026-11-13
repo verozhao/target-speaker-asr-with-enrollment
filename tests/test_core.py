@@ -186,11 +186,16 @@ def test_attach_interferer():
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
     from evaluate import attach_interferer
 
-    ex = [{"id": f"m__s{k + 1}", "mixture_id": "m", "target_index": k, "n_src": 2, "enrollment": {"path": f"e{k}"}}
-          for k in range(2)]
+    ex = [{"id": f"m__s{k + 1}", "mixture_id": "m", "target_index": k, "n_src": 2, "sources": ["a", "b"],
+           "enrollment": {"path": f"e{k}"}} for k in range(2)]
+    ami_solo = {"id": "w__A", "mixture_id": "w", "target_index": 0, "n_src": 1, "sources": [],
+                "enrollment": {"path": "own"}}  # nobody else speaks: must not pair with itself
+    ami = {"id": "v__A", "mixture_id": "v", "target_index": 0, "n_src": 2, "sources": [],
+           "enrollment": {"path": "own"}, "interferer_enrollment": {"path": "other"}, "interferer_index": 1}
     out = attach_interferer(ex + [{"id": "x__s1", "mixture_id": "x", "target_index": 0, "n_src": 2,
-                                   "enrollment": {"path": "lonely"}}])
-    assert len(out) == 2  # x has no sibling line
+                                   "sources": ["a", "b"], "enrollment": {"path": "lonely"}}, ami_solo, ami])
+    assert len(out) == 3  # x has no sibling line, the solo AMI window is dropped
+    assert out[2]["id"] == "v__A" and out[2]["enrolled_index"] == 1
     assert out[0]["interferer_enrollment"]["path"] == "e1" and out[0]["enrolled_index"] == 1
     assert out[1]["interferer_enrollment"]["path"] == "e0" and out[1]["enrolled_index"] == 0
 
@@ -232,7 +237,9 @@ def test_model_features_tiny(tmp_path):
     m2 = TSWhisper.load(str(tmp_path / "lora"))
     assert torch.allclose(m2.sep_emb, m.sep_emb)
     f = TSWhisper("openai/whisper-tiny", conditioning="none", full_ft=True)
-    assert all(p.requires_grad for p in f.whisper.parameters())
+    enc_pos = f.whisper.model.encoder.embed_positions.weight
+    assert not enc_pos.requires_grad  # fixed sinusoids stay frozen, as in Whisper
+    assert all(p.requires_grad for p in f.whisper.parameters() if p is not enc_pos)
     with torch.no_grad():
         f.whisper.model.decoder.layers[0].fc1.bias.add_(1.0)
     f.save(str(tmp_path / "full"))
@@ -337,3 +344,49 @@ def test_ssl_frontend_tiny(tmp_path):
     k = "encoder.layers.0.attention.q_proj.weight"
     assert torch.allclose(m2.ssl.state_dict()[k], m.ssl.state_dict()[k])
     assert torch.allclose(m2.ssl_proj.weight, m.ssl_proj.weight)
+
+
+def test_selection_is_strict():
+    from tsasr.evaluation import score
+
+    ex = [{"id": f"{i}", "mixture_id": f"{i}", "target_index": 0, "texts": t}
+          for i, t in enumerate([["red ball", "blue sky"], ["red ball", "blue sky"], ["red ball", "red ball"],
+                                 ["red ball"]])]
+    hyps = {"0": "red ball", "1": "", "2": "red ball", "3": "red ball"}  # right, empty, tie, single speaker
+    recs, summ = score(ex, hyps)
+    assert [r["follows_enrolled"] for r in recs] == [True, False, False, None]
+    assert summ["n_selection"] == 3 and abs(summ["selection_acc"] - 100 / 3) < 1e-6
+
+
+def _tiny_ssl_model(tmp_path, ssl_train):
+    from transformers import Wav2Vec2FeatureExtractor, WavLMConfig, WavLMModel
+
+    from tsasr.model import TSWhisper
+
+    d = tmp_path / f"tiny_wavlm_{ssl_train}"
+    cfg = WavLMConfig(hidden_size=32, num_hidden_layers=2, num_attention_heads=2, intermediate_size=64,
+                      conv_dim=(32,) * 7, num_conv_pos_embeddings=16, num_conv_pos_embedding_groups=2)
+    assert cfg.feat_extract_norm == "group"
+    WavLMModel(cfg).save_pretrained(d)
+    Wav2Vec2FeatureExtractor(do_normalize=False, return_attention_mask=True).save_pretrained(d)
+    return TSWhisper("openai/whisper-tiny", frontend="ssl", ssl_model=str(d), ssl_train=ssl_train)
+
+
+def test_ssl_features_do_not_depend_on_batch_padding(tmp_path):
+    torch = pytest.importorskip("torch")
+    m = _tiny_ssl_model(tmp_path, "frozen").eval()
+    short, long = torch.randn(1, 4 * SAMPLE_RATE) * 0.1, torch.randn(1, 9 * SAMPLE_RATE) * 0.1
+    alone = m._ssl_frames(short, torch.ones_like(short, dtype=torch.long), torch.tensor([50]), torch.tensor([100]))
+    wav = torch.zeros(2, 9 * SAMPLE_RATE)
+    wav[0, : short.shape[1]], wav[1] = short[0], long[0]
+    mask = (wav != 0).long()
+    mask[0, : short.shape[1]] = 1
+    mask[1] = 1
+    batched = m._ssl_frames(wav, mask, torch.tensor([50, 50]), torch.tensor([100, 300]))
+    assert torch.allclose(alone[0], batched[0], atol=1e-5)
+
+
+def test_frozen_ssl_stays_in_eval_mode(tmp_path):
+    m = _tiny_ssl_model(tmp_path, "frozen")
+    m.train()
+    assert m.training and not m.ssl.training and m.ssl.config.layerdrop == 0.0

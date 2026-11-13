@@ -70,6 +70,8 @@ def main():
     if a.ckpt:
         model = TSWhisper.load(a.ckpt)
         name = model.cfg["model_name"]
+        if model.frontend == "ssl":
+            sys.exit("context_cost.py measures Whisper's 30 s window; use a Whisper-frontend model")
     else:
         model = TSWhisper(a.model, conditioning="none", use_lora=False)
         name = a.model

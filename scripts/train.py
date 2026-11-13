@@ -188,7 +188,8 @@ def main():
                            random_enrollment=not args.no_random_enrollment,
                            frame_labels=args.aux != "none", seed=args.seed)
     # every system trains on the same mixtures: those that fit next to the longest enrollment
-    max_mix = args.max_mix_sec or max_mixture_sec(args.enroll_max, args.gap)
+    # the 0.5 s reference separator keeps the pool identical for silence/learned/none separators
+    max_mix = args.max_mix_sec or max_mixture_sec(args.enroll_max, max(args.gap, 0.5))
     if args.train_manifest:
         train_ex = read_manifest(args.train_manifest)
         n_all = len(train_ex)
@@ -212,7 +213,7 @@ def main():
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, collate_fn=collate,
                           num_workers=args.num_workers, pin_memory=device.type == "cuda", drop_last=True)
 
-    dev_ex = [e for e in read_manifest(args.dev_manifest) if fits(e, args.dev_enroll_dur, args.gap)]
+    dev_ex = [e for e in read_manifest(args.dev_manifest) if fits(e, args.dev_enroll_dur, max(args.gap, 0.5))]
     dev_ex = subset(dev_ex, args.dev_subset, seed=0)
     dev_cfg = DataConfig(conditioning=args.conditioning, gap_sec=args.gap, position=args.position,
                          frontend=args.frontend, train=False, enroll_mode="target", enroll_dur=args.dev_enroll_dur)
@@ -236,7 +237,7 @@ def main():
                                "enroll_choices": args.enroll_choices, "max_mix_sec": round(max_mix, 3)}
     model.whisper.config.use_cache = False
     if args.grad_ckpt:
-        model.whisper.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.enable_gradient_checkpointing()
     params = model.trainable_parameters()
     n_train = sum(p.numel() for p in params)
     n_total = sum(p.numel() for p in model.parameters())

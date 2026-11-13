@@ -51,11 +51,13 @@ def score(examples: List[dict], hyps: Dict[str, str], enroll_mode: str = "target
     The reference is the ENROLLED speaker: ex["enrolled_index"] when present (e.g. the
     interferer for enroll_mode=interferer), else the target.
     ts               WER against the reference speaker's transcript
-    selection_acc    share of outputs closest (by WER) to the reference speaker
+    selection_acc    share of outputs whose WER against the reference speaker is strictly
+                     lower than against every other speaker (mixtures with >= 2 speakers;
+                     an empty output or a tie never counts as a correct selection)
     best_spk         WER against whichever transcript in the mixture is closest
     """
     recs, errs_t, errs_best = [], [], []
-    sel, n_hyp_words, n_tgt_words, n_empty = 0, 0, 0, 0
+    sel, n_sel, n_hyp_words, n_tgt_words, n_empty = 0, 0, 0, 0, 0
     for ex in examples:
         if ex["id"] not in hyps:
             continue
@@ -67,23 +69,28 @@ def score(examples: List[dict], hyps: Dict[str, str], enroll_mode: str = "target
         best = closest_speaker(nh, refs)
         errs_t.append(e_all[k])
         errs_best.append(e_all[best])
-        sel += int(best == k)
+        wers = [(e["sub"] + e["del"] + e["ins"]) / max(e["ref_words"], 1) for e in e_all]
+        follows = None
+        if len(refs) >= 2:
+            follows = all(wers[k] < wers[j] for j in range(len(refs)) if j != k)
+            n_sel += 1
+            sel += int(follows)
         n_hyp_words += len(nh.split())
         n_tgt_words += len(refs[k].split())
         n_empty += int(len(nh.split()) == 0)
         recs.append({
             "id": ex["id"], "mixture_id": ex["mixture_id"], "target_index": ex["target_index"],
             "enrolled_index": k, "enroll_mode": enroll_mode, "hyp": hyp, "hyp_norm": nh, "ref_norm": refs[k],
-            "errors_target": e_all[k], "closest_speaker": best,
-            "wer_per_speaker": [round((e["sub"] + e["del"] + e["ins"]) / max(e["ref_words"], 1), 4)
-                                for e in e_all],
+            "errors_target": e_all[k], "closest_speaker": best, "follows_enrolled": follows,
+            "wer_per_speaker": [round(w, 4) for w in wers],
         })
     n = max(len(recs), 1)
     summary = {
         "enroll_mode": enroll_mode,
         "ts": corpus_scores(errs_t),
         "best_spk": corpus_scores(errs_best),
-        "selection_acc": 100.0 * sel / n,
+        "selection_acc": 100.0 * sel / max(n_sel, 1),
+        "n_selection": n_sel,
         "hyp_to_target_word_ratio": n_hyp_words / max(n_tgt_words, 1),
         "empty_output_rate": 100.0 * n_empty / n,
     }

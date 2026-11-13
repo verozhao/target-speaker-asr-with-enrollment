@@ -119,7 +119,10 @@ fine-tuned (Whisper with `--full-ft`, WavLM) use `--lr-pretrained` 1e-5. Add
 | `exp/wavlm` (ablation) | enrollment + mixture into WavLM, only the mixture frames into Whisper's encoder | enrollment read by WavLM | yes |
 | DiCoW v3.2 | mixture | oracle silence/target/non-target/overlap masks | released model (large-v3-turbo) |
 
-All trained systems use the same mixtures (<= 24.48 s) and schedule.
+All trained systems use the same mixtures (<= 24.48 s) and schedule, except
+`train_len_ablation`, whose mixtures are capped at 19.48 s so that a 10 s enrollment fits.
+The test subset is chosen with a fixed 0.5 s separator (`--fit-gap`), so systems with a
+shorter or no separator are scored on the same mixtures.
 
 ## Metrics and analyses
 

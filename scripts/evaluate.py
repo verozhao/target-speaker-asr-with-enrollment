@@ -57,6 +57,8 @@ def parse_args():
     p.add_argument("--fit-dur", type=float, default=5.0,
                    help="keep mixtures that fit with an enrollment of this length (same subset for every run)")
     p.add_argument("--gap", type=float, default=None, help="default: the checkpoint's training gap (0.5 s)")
+    p.add_argument("--fit-gap", type=float, default=0.5,
+                   help="separator length used only to choose the test subset, the same for every system")
     p.add_argument("--position", default=None, choices=["prefix", "suffix"], help="default: as trained")
     p.add_argument("--lead-sec", type=float, default=0.0, help="silence before the input (position test)")
     p.add_argument("--text-prompt", default=None, help="Whisper previous-text prompt")
@@ -85,9 +87,11 @@ def attach_interferer(examples):
         if e.get("interferer_enrollment"):  # AMI windows carry their own
             out.append({**e, "enrolled_index": e.get("interferer_index", 1)})
             continue
+        if not e.get("sources"):  # real audio (AMI): only windows that carry an interferer enrollment
+            continue
         j = (e["target_index"] + 1) % e["n_src"]
         sib = by_key.get((e["mixture_id"], j))
-        if sib is not None:
+        if sib is not None and j != e["target_index"]:
             out.append({**e, "interferer_enrollment": sib["enrollment"], "enrolled_index": j})
     return out
 
@@ -124,7 +128,11 @@ def main():
     tokens = Tokens(tok)
 
     all_ex = read_manifest(a.manifest)
-    ex = [e for e in all_ex if fits(e, a.fit_dur, gap, a.lead_sec) and all(e.get(k) for k in a.require_key)]
+    if a.enroll_mode != "none" and a.enroll_dur is not None and a.enroll_dur + a.lead_sec > a.fit_dur + 1e-9:
+        sys.exit("--enroll-dur + --lead-sec must not exceed --fit-dur (the test subset would not fit)")
+    # the subset depends only on --fit-dur/--fit-gap, never on the model, so every system and
+    # every position test is scored on identical mixtures
+    ex = [e for e in all_ex if fits(e, a.fit_dur, max(a.fit_gap, gap)) and all(e.get(k) for k in a.require_key)]
     if a.enroll_mode == "interferer":
         ex = attach_interferer(ex)
     elif a.enroll_mode in ("target", "silence"):

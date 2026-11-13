@@ -42,8 +42,8 @@ def main():
         ra, rb = A[i], B[i]
         same += int(ra["hyp_norm"] == rb["hyp_norm"])
         errs.append(word_errors(ra["hyp_norm"], rb["hyp_norm"]))
-        fa = ra["closest_speaker"] == ra["enrolled_index"]
-        fb = rb["closest_speaker"] == rb["enrolled_index"]
+        fa = bool(ra["follows_enrolled"]) if "follows_enrolled" in ra else ra["closest_speaker"] == ra["enrolled_index"]
+        fb = bool(rb["follows_enrolled"]) if "follows_enrolled" in rb else rb["closest_speaker"] == rb["enrolled_index"]
         fol_a += fa
         fol_b += fb
         sw += int(fa and fb and ra["enrolled_index"] != rb["enrolled_index"])

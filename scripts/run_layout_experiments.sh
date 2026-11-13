@@ -1,32 +1,33 @@
 #!/usr/bin/env bash
-# Enrollment-layout experiments (docs/layout_experiments.md). All three train on the
-# same mixtures (same seed, mixtures <= 19.48 s) and are tested on the same mixtures:
+# Enrollment ablations (docs/layout_experiments.md). All runs train on the same mixtures
+# (same seed, mixtures <= 19.48 s) and are tested on the same mixtures at 1/2/5/10 s:
 #
-#   padding  random 1-10 s enrollment | 0.5 s separator | mixture | padding to 30 s
-#            (the mixture starts later when the enrollment is longer)
-#   anchor   random 1-10 s enrollment | silence up to 10.5 s | mixture
-#            (the mixture always starts at 10.5 s, only the silence changes)
-#   fixed5   fixed 5 s enrollment | 0.5 s separator | mixture | padding to 30 s
+#   random        random 1-10 s enrollment | 0.5 s separator | mixture   -> Whisper
+#   fixed5        fixed 5 s enrollment     | 0.5 s separator | mixture   -> Whisper
+#   wavlm         fixed 5 s enrollment | mixture -> WavLM; the enrollment frames are dropped
+#                 and the mixture frames go into Whisper's encoder in place of its conv stem
+#   wavlm_random  as wavlm with a random 1-10 s enrollment (optional, not part of "all")
 #
 # Usage (from the repository root):
-#   bash scripts/run_layout_experiments.sh train padding|anchor|fixed5|all
-#   bash scripts/run_layout_experiments.sh eval  padding|anchor|fixed5|all
+#   bash scripts/run_layout_experiments.sh train random|fixed5|wavlm|wavlm_random|all
+#   bash scripts/run_layout_experiments.sh eval  random|fixed5|wavlm|wavlm_random|all
 #   bash scripts/run_layout_experiments.sh table
-#   sbatch slurm/job.sbatch bash scripts/run_layout_experiments.sh train anchor
+#   sbatch slurm/job.sbatch bash scripts/run_layout_experiments.sh train wavlm
 #
 # Options (environment variables):
-#   ENROLL_CHOICES=1,2,5,10   train the random layouts on these lengths only (default: uniform 1-10 s)
-#   MIX_START=10.5            anchor position in seconds (longest enrollment + 0.5 s separator)
+#   WHISPER_FT=full|lora      full: fine-tune all of Whisper in every run (default); lora: LoRA only
+#   WAVLM_TRAIN=full|frozen   fine-tune WavLM (default) or keep it frozen (less GPU memory)
+#   WAVLM_MODEL=microsoft/wavlm-base-plus   or microsoft/wavlm-large
+#   ENROLL_CHOICES=1,2,5,10   random runs draw only these lengths (default: uniform 1-10 s)
 #   WITH_3MIX=1               also evaluate on Libri3Mix
-#   EXTRA_TRAIN_ARGS="..."    passed to every train.py call (e.g. "--max-steps 200" for a dry run)
+#   EXTRA_TRAIN_ARGS="..."    passed to every train.py call (e.g. "--max-steps 200 --grad-ckpt")
 #   EXTRA_EVAL_ARGS="..."     passed to every evaluate.py call (e.g. "--batch-size 32")
 #   TRAIN_SOURCE=ls960|libri2mix  as in scripts/run.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source config.sh
 mkdir -p "$EXP" "$RESULTS" logs
-MIX_START=${MIX_START:-10.5}
-MAX_MIX=19.48                       # 30 s - 10.5 s - one 20 ms frame
+MAX_MIX=19.48                       # mixtures that fit next to a 10 s enrollment + 0.5 s separator
 LENGTHS="1 2 5 10"
 T2=$DATA/libri2mix_test.jsonl
 T3=$DATA/libri3mix_test.jsonl
@@ -36,22 +37,27 @@ if [ "$TRAIN_SOURCE" = "ls960" ]; then
 else
   TRAIN_DATA=(--train-manifest "$DATA/libri2mix_train-100.jsonl" --speaker-pool "$DATA/speaker_pool_train-100.json")
 fi
+FT=()
+if [ "${WHISPER_FT:-full}" = "full" ]; then FT=(--full-ft); fi
 # shellcheck disable=SC2206
 EXTRA=(${EXTRA_TRAIN_ARGS:-})
 # shellcheck disable=SC2206
 EVX=(${EXTRA_EVAL_ARGS:-})
-CHOICES=()
-if [ -n "${ENROLL_CHOICES:-}" ]; then CHOICES=(--enroll-choices "$ENROLL_CHOICES"); fi
+RANDOM_LEN=(--enroll-min 1 --enroll-max 10)
+if [ -n "${ENROLL_CHOICES:-}" ]; then RANDOM_LEN=(--enroll-choices "$ENROLL_CHOICES"); fi
+WAVLM=(--frontend ssl --separator none --ssl-model "${WAVLM_MODEL:-microsoft/wavlm-base-plus}"
+       --ssl-train "${WAVLM_TRAIN:-full}")
 
 train_one() {
-  local name=$1 out="$EXP/layout_$1"
+  local name=$1
   local common=(python scripts/train.py "${TRAIN_DATA[@]}" --dev-manifest "$DATA/libri2mix_dev.jsonl"
-                --model "$MODEL" --seed 0 --gap 0.5 --dev-enroll-dur 5 --out-dir "$out")
+                --model "$MODEL" --seed 0 --dev-enroll-dur 5 --max-mix-sec "$MAX_MIX"
+                --out-dir "$EXP/layout_$name" ${FT[@]+"${FT[@]}"})
   case "$name" in
-    padding) "${common[@]}" --enroll-min 1 --enroll-max 10 ${CHOICES[@]+"${CHOICES[@]}"} --max-mix-sec "$MAX_MIX" ${EXTRA[@]+"${EXTRA[@]}"} ;;
-    anchor)  "${common[@]}" --enroll-min 1 --enroll-max 10 ${CHOICES[@]+"${CHOICES[@]}"} --mix-start "$MIX_START" \
-               --max-mix-sec "$MAX_MIX" ${EXTRA[@]+"${EXTRA[@]}"} ;;
-    fixed5)  "${common[@]}" --enroll-min 5 --enroll-max 5 --max-mix-sec "$MAX_MIX" ${EXTRA[@]+"${EXTRA[@]}"} ;;
+    random)       "${common[@]}" "${RANDOM_LEN[@]}" ${EXTRA[@]+"${EXTRA[@]}"} ;;
+    fixed5)       "${common[@]}" --enroll-min 5 --enroll-max 5 ${EXTRA[@]+"${EXTRA[@]}"} ;;
+    wavlm)        "${common[@]}" --enroll-min 5 --enroll-max 5 "${WAVLM[@]}" ${EXTRA[@]+"${EXTRA[@]}"} ;;
+    wavlm_random) "${common[@]}" "${RANDOM_LEN[@]}" "${WAVLM[@]}" ${EXTRA[@]+"${EXTRA[@]}"} ;;
     *) echo "unknown experiment $name"; exit 1 ;;
   esac
 }
@@ -79,9 +85,9 @@ eval_one() {
 }
 
 each() {  # stage, name|all
-  local fn=$1 which=${2:?padding|anchor|fixed5|all}
+  local fn=$1 which=${2:?random|fixed5|wavlm|wavlm_random|all}
   if [ "$which" = "all" ]; then
-    for n in padding anchor fixed5; do "$fn" "$n"; done
+    for n in random fixed5 wavlm; do "$fn" "$n"; done
   else
     "$fn" "$which"
   fi

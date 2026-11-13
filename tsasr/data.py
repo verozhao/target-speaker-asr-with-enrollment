@@ -45,19 +45,14 @@ def read_manifest(path: str) -> List[dict]:
         return [json.loads(ln) for ln in f if ln.strip()]
 
 
-def max_mixture_sec(enroll_sec: float, gap_sec: float, lead_sec: float = 0.0,
-                    mix_start: Optional[float] = None) -> float:
-    """Longest mixture that fits in 30 s next to the enrollment, separator and lead.
-    With mix_start (anchored layout) the mixture always starts at mix_start seconds."""
-    if mix_start is not None:
-        return WHISPER_WINDOW_SEC - mix_start - SLACK
+def max_mixture_sec(enroll_sec: float, gap_sec: float, lead_sec: float = 0.0) -> float:
+    """Longest mixture that fits in 30 s next to the enrollment, separator and lead."""
     slack = SLACK * (2 if lead_sec > 0 else 1)
     return WHISPER_WINDOW_SEC - enroll_sec - gap_sec - lead_sec - slack
 
 
-def fits(ex: dict, enroll_sec: float, gap_sec: float, lead_sec: float = 0.0,
-         mix_start: Optional[float] = None) -> bool:
-    return ex["duration"] <= max_mixture_sec(enroll_sec, gap_sec, lead_sec, mix_start) + 1e-9
+def fits(ex: dict, enroll_sec: float, gap_sec: float, lead_sec: float = 0.0) -> bool:
+    return ex["duration"] <= max_mixture_sec(enroll_sec, gap_sec, lead_sec) + 1e-9
 
 
 class Tokens:
@@ -82,14 +77,12 @@ class Tokens:
 @dataclass
 class DataConfig:
     conditioning: str = "prefix"        # prefix | spk_emb | none
+    frontend: str = "whisper"           # whisper (log-Mel + conv stem) | ssl (raw waveform for WavLM)
     input_kind: str = "mixture"         # mixture | source (clean target, topline)
-    gap_sec: float = 0.5                # separator length (silence, or frames of a learned token)
+    gap_sec: float = 0.5                # separator length (silence, or frames of a learned token); 0 = none
     position: str = "prefix"            # prefix | suffix (enrollment before / after the mixture)
     lead_sec: float = 0.0               # silence before everything (positional-embedding tests)
     random_lead: bool = False           # train: random lead within the free part of the window
-    mix_start: Optional[float] = None   # anchored layout: the mixture always starts here (s) and
-                                        # the separator fills the time after the enrollment
-                                        # (gap_sec is then the minimum separator)
     # training enrollment
     train: bool = False
     enroll_min: float = 5.0
@@ -126,8 +119,6 @@ class _Base(Dataset):
         c = self.cfg
         if c.conditioning != "prefix":
             return float("inf")
-        if c.mix_start is not None:
-            return c.mix_start - c.gap_sec
         return WHISPER_WINDOW_SEC - mix_sec - c.gap_sec - 2 * SLACK
 
     def _enroll_len(self, mix_sec: float, rng) -> Optional[float]:
@@ -157,36 +148,35 @@ class _Base(Dataset):
             enroll = rms_normalize(enroll)
 
         use_enroll = c.conditioning == "prefix" and enroll is not None
-        lead, gap = c.lead_sec, c.gap_sec
-        if c.mix_start is not None:
-            # anchored layout: [enrollment | silence up to mix_start | mixture]
-            if use_enroll:
-                enroll = enroll[: int(round((c.mix_start - c.gap_sec) * SAMPLE_RATE))]
-                gap = c.mix_start - len(enroll) / SAMPLE_RATE
-            else:  # no enrollment: keep the mixture at the same position
-                lead = c.mix_start
-        elif c.train and c.random_lead:
-            used = len(mixture) / SAMPLE_RATE + ((len(enroll) / SAMPLE_RATE + gap) if use_enroll else 0.0)
+        lead = c.lead_sec
+        if c.train and c.random_lead:
+            used = len(mixture) / SAMPLE_RATE + ((len(enroll) / SAMPLE_RATE + c.gap_sec) if use_enroll else 0.0)
             lead = float(rng.uniform(0.0, max(WHISPER_WINDOW_SEC - used - 3 * SLACK, 0.0)))
-        wav, spans = compose_input(enroll if use_enroll else None, mixture, gap, c.position, lead)
-        if len(wav) > WHISPER_WINDOW_SAMPLES:
-            wav = wav[:WHISPER_WINDOW_SAMPLES]
-        feats = self.fe(wav, sampling_rate=SAMPLE_RATE, return_tensors="np").input_features[0]
-
+        wav, spans = compose_input(enroll if use_enroll else None, mixture, c.gap_sec, c.position, lead)
         dec_in, labels = self.tokens.build(training_text(texts[k]))
         item = {
             "id": ex_id,
-            "input_features": feats.astype(np.float32),
             "dec_in": dec_in,
             "labels": labels,
             "enroll_span": spans["enroll"],
             "sep_span": spans["sep"],
             "mix_offset": spans["mix"][0],
+            "mix_frames": spans["mix"][1] - spans["mix"][0],
         }
+        if c.frontend == "ssl":
+            # WavLM reads the whole [enrollment | separator | mixture] waveform; the model keeps
+            # only the mixture frames, which start at encoder position 0 inside Whisper
+            item["wav"] = wav.astype(np.float32)
+        else:
+            if len(wav) > WHISPER_WINDOW_SAMPLES:
+                wav = wav[:WHISPER_WINDOW_SAMPLES]
+            feats = self.fe(wav, sampling_rate=SAMPLE_RATE, return_tensors="np").input_features[0]
+            item["input_features"] = feats.astype(np.float32)
         if c.conditioning == "spk_emb":
             item["enroll_wav"] = enroll if enroll is not None else np.zeros(SAMPLE_RATE, np.float32)
         if c.frame_labels:
-            item["frame_labels"] = self._frame_labels(sources, k, spans["mix"][0])
+            off = 0 if c.frontend == "ssl" else spans["mix"][0]  # ssl: mixture frames start at 0
+            item["frame_labels"] = self._frame_labels(sources, k, off)
         return item
 
     def _frame_labels(self, sources, k, off):
@@ -356,13 +346,23 @@ class Collator:
             lab[i, : len(b["labels"])] = torch.tensor(b["labels"])
         out = {
             "ids": [b["id"] for b in batch],
-            "input_features": torch.from_numpy(np.stack([b["input_features"] for b in batch])),
             "decoder_input_ids": dec,
             "labels": lab,
             "enroll_span": torch.tensor([b["enroll_span"] for b in batch], dtype=torch.long),
             "sep_span": torch.tensor([b["sep_span"] for b in batch], dtype=torch.long),
             "mix_offset": torch.tensor([b["mix_offset"] for b in batch]),
+            "mix_frames": torch.tensor([b["mix_frames"] for b in batch]),
         }
+        if "input_features" in batch[0]:
+            out["input_features"] = torch.from_numpy(np.stack([b["input_features"] for b in batch]))
+        if "wav" in batch[0]:
+            n = max(len(b["wav"]) for b in batch)
+            w = torch.zeros(len(batch), n)
+            m = torch.zeros(len(batch), n, dtype=torch.long)
+            for i, b in enumerate(batch):
+                w[i, : len(b["wav"])] = torch.from_numpy(b["wav"])
+                m[i, : len(b["wav"])] = 1
+            out["wav"], out["wav_mask"] = w, m
         if "frame_labels" in batch[0]:
             out["frame_labels"] = torch.from_numpy(np.stack([b["frame_labels"] for b in batch])).long()
         if "enroll_wav" in batch[0]:

@@ -13,7 +13,7 @@ and no speaker-embedding module are needed:
 
 | Requirement | Where |
 |---|---|
-| Train on [~5 s enrollment + 0.5 s silence or learned token + mixture up to 25 s], target transcript as label | defaults of `train.py` (`--enroll-min/max 5`, mixtures <= 24.48 s), `--separator silence\|learned` |
+| Train on [~5 s enrollment + 0.5 s silence or learned token + mixture up to 25 s], target transcript as label | defaults of `train.py` (`--enroll-min/max 5`, mixtures <= 24.48 s), `--separator silence\|learned\|none` |
 | LibriMix/LibriSpeechMix-style mixtures built from LibriSpeech 960 | `--train-index` (on-the-fly mixing, `--overlap full\|partial`, `--n-src-probs`), default of `run.sh` |
 | Whisper-small, full or LoRA | LoRA default, `--full-ft` |
 | TS-WER on 2- and 3-speaker mixtures | Libri2Mix / Libri3Mix test |
@@ -27,6 +27,7 @@ and no speaker-embedding module are needed:
 | Cost of losing 5 s of context | `context_cost.py` (30 s vs 24.5 s windows) |
 | Open question: positional embeddings | `--lead-sec`, `--position suffix`, `--random-lead` |
 | Open question: enrollment + text prompt | `--text-prompt` |
+| Architecture ablation suggested by the TA: WavLM reads [enrollment, mixture], its mixture frames replace Whisper's front-end | `--frontend ssl` (`scripts/run_layout_experiments.sh train wavlm`) |
 
 Not covered: OWSM v3.1 (Whisper-small is used), a streaming model, and CHiME-6 or
 NOTSOFAR (AMI is the real-data set).
@@ -53,7 +54,7 @@ NOTSOFAR (AMI is the real-data set).
 | `scripts/eval_dicow.py` | DiCoW v3.2 with oracle diarization masks |
 | `scripts/summarize.py` | one Markdown table of every result |
 | `scripts/run.sh` | stage driver with the exact command of every experiment |
-| `scripts/run_layout_experiments.sh`, `scripts/layout_table.py` | enrollment-layout experiments (padding / anchored / fixed 5 s) and their results matrix, see `docs/layout_experiments.md` |
+| `scripts/run_layout_experiments.sh`, `scripts/layout_table.py` | enrollment ablations (random length / fixed 5 s / WavLM front-end) and their results matrix, see `docs/layout_experiments.md` |
 | `slurm/*.sbatch` | SLURM wrappers (one GPU, multi-GPU) |
 | `tools/make_toy_librimix.py` | macOS toy corpus for a laptop smoke test |
 
@@ -91,16 +92,19 @@ Variants: `train_learned_sep`, `train_fullft`, `train_len_ablation` (random 1-10
 enrollment), `train_aug`, `train_aux`, `eval_perturbed`. `TRAIN_SOURCE=libri2mix`
 trains on the pre-built Libri2Mix train-100 set instead of LibriSpeech 960.
 
-Enrollment-layout experiments (random 1-10 s enrollment with padding, random enrollment
-with the mixture anchored at 10.5 s, fixed 5 s, all on identical mixtures) have their own
-driver and instructions in [docs/layout_experiments.md](docs/layout_experiments.md).
+Enrollment ablations (random 1-10 s enrollment, fixed 5 s enrollment, and a WavLM
+front-end that reads the enrollment and passes only the mixture frames to Whisper, all on
+identical mixtures) have their own driver and instructions in
+[docs/layout_experiments.md](docs/layout_experiments.md).
 
 Training resumes from `<out-dir>/last` when the same command is re-run, so a job that
 hits the time limit can be resubmitted. Multi-GPU:
 `sbatch --gres=gpu:4 slurm/job_multigpu.sbatch scripts/train.py <args>`. Defaults:
-batch 8 per GPU, gradient accumulation 2, lr 3e-4 (LoRA) with cosine decay, 4 epochs of
-50k on-the-fly examples, LoRA r=32 / alpha=64 on q/k/v/out, bf16 autocast where
-supported. Full fine-tuning uses `--lr 1e-5`. Add `--grad-ckpt` if memory runs out.
+batch 8 per GPU, gradient accumulation 2, cosine decay, 4 epochs of 50k on-the-fly
+examples, LoRA r=32 / alpha=64 on q/k/v/out, bf16 autocast where supported. New
+parameters (LoRA, projections, heads) use `--lr` 3e-4, and pretrained weights that are
+fine-tuned (Whisper with `--full-ft`, WavLM) use `--lr-pretrained` 1e-5. Add
+`--grad-ckpt` if memory runs out.
 
 ## Systems
 
@@ -112,6 +116,7 @@ supported. Full fine-tuning uses `--lr 1e-5`. Add `--grad-ckpt` if memory runs o
 | `exp/none` | mixture | none | yes |
 | `exp/prefix` (ours) | enrollment + separator + mixture | audio prefix | yes |
 | `exp/spk_wavlm`, `exp/spk_titanet` | mixture | speaker embedding added to the encoder conv stem | yes |
+| `exp/wavlm` (ablation) | enrollment + mixture into WavLM, only the mixture frames into Whisper's encoder | enrollment read by WavLM | yes |
 | DiCoW v3.2 | mixture | oracle silence/target/non-target/overlap masks | released model (large-v3-turbo) |
 
 All trained systems use the same mixtures (<= 24.48 s) and schedule.

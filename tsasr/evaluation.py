@@ -28,13 +28,14 @@ def decode(model, loader, tokenizer, device, amp_dtype=None, spk_encoder=None, n
         prompt_ids = prompt_ids.to(device)
         prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True).strip()
     for batch in tqdm(loader, desc="decode", disable=not progress):
-        feats = batch["input_features"].to(device)
+        feats = batch["input_features"].to(device) if "input_features" in batch else None
+        ssl = {k: batch[k].to(device) for k in ("wav", "wav_mask", "mix_offset", "mix_frames")} if "wav" in batch else {}
         spk = None
         if spk_encoder is not None:
             spk = spk_encoder(batch["enroll_wav"].to(device), batch["enroll_mask"].to(device))
         with autocast(device, amp_dtype):
             seqs = model.generate(feats, spk_emb=spk, sep_span=batch["sep_span"].to(device), num_beams=num_beams,
-                                  max_new_tokens=max_new_tokens, prompt_ids=prompt_ids)
+                                  max_new_tokens=max_new_tokens, prompt_ids=prompt_ids, **ssl)
         texts = tokenizer.batch_decode(seqs, skip_special_tokens=True)
         for i, t in zip(batch["ids"], texts):
             t = t.strip()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Results matrix of the enrollment-layout experiments.
 
-Rows: experiment (padding, anchor, fixed5). Columns: test enrollment length and the
+Rows: experiment (random, fixed5, wavlm, wavlm_random). Columns: test enrollment length and the
 controls. Cell: TS-WER % (selection accuracy %). One table per test set.
 
   python scripts/layout_table.py results/ > results/layout_table.md
@@ -13,7 +13,7 @@ import re
 import sys
 from collections import defaultdict
 
-EXPERIMENTS = ("padding", "anchor", "fixed5")
+EXPERIMENTS = ("random", "fixed5", "wavlm", "wavlm_random")
 COLUMNS = ["1s", "2s", "5s", "10s", "silence", "none", "other"]
 
 

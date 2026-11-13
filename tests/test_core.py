@@ -264,23 +264,13 @@ class _StubTokens:
         return [1, 2], [3, 4]
 
 
-def _layout_item(enroll_sec, mix_start=None, mode_none=False):
+def _layout_item(enroll_sec, frontend="whisper", gap=0.5, mode_none=False):
     from tsasr.data import DataConfig, _Base
 
-    ds = _Base(_StubFE(), _StubTokens(), DataConfig(gap_sec=0.5, mix_start=mix_start))
+    ds = _Base(_StubFE(), _StubTokens(), DataConfig(gap_sec=gap, frontend=frontend))
     enr = None if mode_none else tone(enroll_sec)
     item = ds._finish("m__s1", tone(9.5), None, 0, ["a"], enr, np.random.default_rng(0))
-    return item, ds.fe.last_len
-
-
-def test_anchored_layout_keeps_mixture_position():
-    for L in (1, 2, 5, 10):
-        item, n = _layout_item(L, mix_start=10.5)
-        assert item["mix_offset"] == 525  # 10.5 s at 50 frames/s
-        assert item["enroll_span"] == (0, L * 50) and item["sep_span"] == (L * 50, 525)
-        assert n == int(20.0 * SAMPLE_RATE)  # 10.5 s + the 9.5 s mixture = the 20 s input
-    item, _ = _layout_item(5, mix_start=10.5, mode_none=True)
-    assert item["mix_offset"] == 525 and item["enroll_span"] == (0, 0)
+    return item, getattr(ds.fe, "last_len", None)
 
 
 def test_padding_layout_moves_mixture():
@@ -288,15 +278,62 @@ def test_padding_layout_moves_mixture():
         item, n = _layout_item(L)
         assert item["mix_offset"] == L * 50 + 25  # enrollment + 0.5 s separator
         assert n == int((L + 0.5 + 9.5) * SAMPLE_RATE)
+        assert item["mix_frames"] == 475
+
+
+def test_ssl_item_carries_waveform():
+    item, n = _layout_item(5, frontend="ssl", gap=0.0)
+    assert n is None and "input_features" not in item  # no log-Mel for the WavLM front-end
+    assert len(item["wav"]) == int(14.5 * SAMPLE_RATE) and item["mix_offset"] == 250
+    from tsasr.data import Collator
+
+    b = Collator(0)([{**item, "dec_in": [1, 2], "labels": [3, 4]}, {**_layout_item(2, "ssl", 0.0)[0],
+                                                                     "dec_in": [1], "labels": [3]}])
+    assert b["wav"].shape == (2, int(14.5 * SAMPLE_RATE)) and b["wav_mask"][1].sum() == int(11.5 * SAMPLE_RATE)
+    assert b["mix_offset"].tolist() == [250, 100] and "input_features" not in b
 
 
 def test_enroll_choices_respect_room():
     from tsasr.data import DataConfig, _Base
 
     rng = np.random.default_rng(0)
-    ds = _Base(None, None, DataConfig(train=True, enroll_choices=(1, 2, 5, 10), mix_start=10.5))
-    assert {ds._enroll_len(19.0, rng) for _ in range(200)} == {1.0, 2.0, 5.0, 10.0}
     ds = _Base(None, None, DataConfig(train=True, enroll_choices=(1, 2, 5, 10)))
+    assert {ds._enroll_len(19.0, rng) for _ in range(200)} == {1.0, 2.0, 5.0, 10.0}
     assert {ds._enroll_len(25.0, rng) for _ in range(200)} <= {1.0, 2.0}  # 30 - 25 - 0.5 leaves < 5 s
-    ds = _Base(None, None, DataConfig(train=True, enroll_min=1, enroll_max=10, mix_start=10.5))
+    ds = _Base(None, None, DataConfig(train=True, enroll_min=1, enroll_max=10))
     assert all(1.0 <= ds._enroll_len(19.0, rng) <= 10.0 for _ in range(200))
+
+
+def test_ssl_frontend_tiny(tmp_path):
+    torch = pytest.importorskip("torch")
+    from transformers import Wav2Vec2FeatureExtractor, WavLMConfig, WavLMModel
+
+    from tsasr.model import TSWhisper
+
+    ssl_dir = tmp_path / "tiny_wavlm"
+    cfg = WavLMConfig(hidden_size=32, num_hidden_layers=2, num_attention_heads=2, intermediate_size=64,
+                      conv_dim=(32,) * 7, num_conv_pos_embeddings=16, num_conv_pos_embedding_groups=2)
+    WavLMModel(cfg).save_pretrained(ssl_dir)
+    Wav2Vec2FeatureExtractor(do_normalize=False, return_attention_mask=True).save_pretrained(ssl_dir)
+    m = TSWhisper("openai/whisper-tiny", frontend="ssl", ssl_model=str(ssl_dir), ssl_train="full", full_ft=True)
+    wav = torch.randn(2, int(9.5 * SAMPLE_RATE)) * 0.1
+    mask = torch.ones_like(wav, dtype=torch.long)
+    mask[1, int(7.0 * SAMPLE_RATE):] = 0
+    dec = torch.tensor([[50258, 50259, 50360, 50364, 400], [50258, 50259, 50360, 50364, 401]])
+    lab = torch.tensor([[-100, -100, -100, 400, 50257], [-100, -100, -100, 401, 50257]])
+    kw = dict(wav=wav, wav_mask=mask, mix_offset=torch.tensor([250, 100]), mix_frames=torch.tensor([225, 250]))
+    out = m(decoder_input_ids=dec, labels=lab, **kw)
+    out["loss"].backward()
+    assert m.ssl_proj.weight.grad.abs().sum() > 0 and m.ssl_layer_w.grad is not None
+    assert m.ssl.encoder.layers[0].attention.q_proj.weight.grad is not None      # WavLM is fine-tuned
+    assert all(p.grad is None for p in m.ssl.feature_extractor.parameters())    # its CNN stays frozen
+    assert m.whisper.model.encoder.conv1.weight.grad is None                     # Whisper's stem is bypassed
+    groups = m.param_groups(3e-4, 1e-5)
+    assert any(p is m.ssl_proj.weight for p in groups[0]["params"]) and groups[1]["lr"] == 1e-5
+    seqs = m.generate(max_new_tokens=3, **kw)
+    assert seqs.shape[0] == 2
+    m.save(str(tmp_path / "ck"))
+    m2 = TSWhisper.load(str(tmp_path / "ck"))
+    k = "encoder.layers.0.attention.q_proj.weight"
+    assert torch.allclose(m2.ssl.state_dict()[k], m.ssl.state_dict()[k])
+    assert torch.allclose(m2.ssl_proj.weight, m.ssl_proj.weight)

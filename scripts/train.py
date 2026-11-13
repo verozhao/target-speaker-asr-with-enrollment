@@ -48,10 +48,15 @@ def parse_args():
     p.add_argument("--conditioning", default="prefix", choices=["prefix", "spk_emb", "none"],
                    help="prefix = ours, spk_emb = embedding baseline, none = no-conditioning baseline")
     p.add_argument("--spk-encoder", default="wavlm", choices=["wavlm", "titanet", "ecapa"])
-    p.add_argument("--separator", default="silence", choices=["silence", "learned"])
+    p.add_argument("--separator", default="silence", choices=["silence", "learned", "none"],
+                   help="none = enrollment directly followed by the mixture (gap 0)")
+    p.add_argument("--frontend", default="whisper", choices=["whisper", "ssl"],
+                   help="ssl = WavLM reads [enrollment | mixture], its mixture frames replace Whisper's conv stem")
+    p.add_argument("--ssl-model", default="microsoft/wavlm-base-plus")
+    p.add_argument("--ssl-train", default="full", choices=["full", "frozen"], help="fine-tune WavLM or keep it frozen")
     p.add_argument("--position", default="prefix", choices=["prefix", "suffix"], help="enrollment before/after the mixture")
     p.add_argument("--random-lead", action="store_true", help="random start position inside the 30 s window")
-    p.add_argument("--full-ft", action="store_true", help="full fine-tuning instead of LoRA (use a lower --lr)")
+    p.add_argument("--full-ft", action="store_true", help="full fine-tuning of Whisper instead of LoRA")
     p.add_argument("--aux", default="none", choices=["none", "activity", "contrastive"])
     p.add_argument("--aux-weight", type=float, default=0.1)
     # augmentation
@@ -66,8 +71,6 @@ def parse_args():
     p.add_argument("--enroll-min", type=float, default=5.0, help="5/5 = fixed 5 s (spec); 1/10 = random length")
     p.add_argument("--enroll-max", type=float, default=5.0)
     p.add_argument("--enroll-choices", default=None, help="draw the length from a list instead, e.g. 1,2,5,10")
-    p.add_argument("--mix-start", type=float, default=None,
-                   help="anchored layout: mixture always starts at this second, silence fills after the enrollment")
     p.add_argument("--max-mix-sec", type=float, default=None,
                    help="mixture length cap; give every run of a comparison the same value to train on identical mixtures")
     p.add_argument("--gap", type=float, default=None, help="separator seconds (default 0.5 silence, 0.02 learned)")
@@ -78,7 +81,9 @@ def parse_args():
     p.add_argument("--lora-dropout", type=float, default=0.05)
     p.add_argument("--lora-targets", default="q_proj,k_proj,v_proj,out_proj")
     # optimisation
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, default=3e-4, help="new parameters: LoRA, projections, heads")
+    p.add_argument("--lr-pretrained", type=float, default=1e-5,
+                   help="pretrained weights that are fine-tuned (Whisper with --full-ft, WavLM with --ssl-train full)")
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-steps", type=int, default=500)
     p.add_argument("--epochs", type=int, default=4)
@@ -99,15 +104,12 @@ def parse_args():
     p.add_argument("--max-train-examples", type=int, default=None, help="debug: cap training set")
     a = p.parse_args()
     if a.gap is None:
-        a.gap = 0.02 if a.separator == "learned" else 0.5
+        a.gap = {"learned": 0.02, "none": 0.0}.get(a.separator, 0.5)
     a.enroll_choices = tuple(float(x) for x in a.enroll_choices.split(",")) if a.enroll_choices else None
     if a.enroll_choices:
         a.enroll_min, a.enroll_max = min(a.enroll_choices), max(a.enroll_choices)
-    if a.mix_start is not None:
-        if a.position != "prefix":
-            raise SystemExit("--mix-start needs --position prefix")
-        if a.enroll_max > a.mix_start - a.gap + 1e-9:
-            raise SystemExit("--mix-start must leave room for the longest enrollment plus --gap")
+    if a.frontend == "ssl" and (a.conditioning != "prefix" or a.separator == "learned" or a.position != "prefix"):
+        raise SystemExit("--frontend ssl needs --conditioning prefix, --position prefix and a silence/none separator")
     return a
 
 
@@ -181,12 +183,12 @@ def main():
     augmenter = Augmenter(args.noise_list, args.rir_list, args.aug, args.p_noise, args.p_rir,
                           (args.snr_min, args.snr_max)) if args.aug != "none" else None
     train_cfg = DataConfig(conditioning=args.conditioning, gap_sec=args.gap, position=args.position,
-                           random_lead=args.random_lead, mix_start=args.mix_start, train=True,
+                           random_lead=args.random_lead, frontend=args.frontend, train=True,
                            enroll_min=args.enroll_min, enroll_max=args.enroll_max, enroll_choices=args.enroll_choices,
                            random_enrollment=not args.no_random_enrollment,
                            frame_labels=args.aux != "none", seed=args.seed)
     # every system trains on the same mixtures: those that fit next to the longest enrollment
-    max_mix = args.max_mix_sec or max_mixture_sec(args.enroll_max, args.gap, mix_start=args.mix_start)
+    max_mix = args.max_mix_sec or max_mixture_sec(args.enroll_max, args.gap)
     if args.train_manifest:
         train_ex = read_manifest(args.train_manifest)
         n_all = len(train_ex)
@@ -210,11 +212,10 @@ def main():
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, collate_fn=collate,
                           num_workers=args.num_workers, pin_memory=device.type == "cuda", drop_last=True)
 
-    dev_ex = [e for e in read_manifest(args.dev_manifest)
-              if fits(e, args.dev_enroll_dur, args.gap, mix_start=args.mix_start)]
+    dev_ex = [e for e in read_manifest(args.dev_manifest) if fits(e, args.dev_enroll_dur, args.gap)]
     dev_ex = subset(dev_ex, args.dev_subset, seed=0)
     dev_cfg = DataConfig(conditioning=args.conditioning, gap_sec=args.gap, position=args.position,
-                         mix_start=args.mix_start, train=False, enroll_mode="target", enroll_dur=args.dev_enroll_dur)
+                         frontend=args.frontend, train=False, enroll_mode="target", enroll_dur=args.dev_enroll_dur)
     dev_dl = DataLoader(ManifestDataset(dev_ex, fe, tokens, dev_cfg), batch_size=args.dev_batch_size,
                         shuffle=False, collate_fn=collate, num_workers=min(args.num_workers, 4))
     log({"event": "data", "train_examples": len(train_ds), "train_pool": n_all, "max_mixture_sec": round(max_mix, 2),
@@ -226,9 +227,11 @@ def main():
                       lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
                       lora_targets=args.lora_targets.split(","),
                       spk_dim=spk_enc.dim if spk_enc is not None else 512,
-                      spk_encoder=args.spk_encoder, separator=args.separator, full_ft=args.full_ft).to(device)
+                      spk_encoder=args.spk_encoder, separator="learned" if args.separator == "learned" else "silence",
+                      full_ft=args.full_ft, frontend=args.frontend, ssl_model=args.ssl_model,
+                      ssl_train=args.ssl_train).to(device)
     # data settings the evaluator must reuse
-    model.cfg["train_data"] = {"gap": args.gap, "position": args.position, "mix_start": args.mix_start,
+    model.cfg["train_data"] = {"gap": args.gap, "position": args.position, "separator": args.separator,
                                "enroll_min": args.enroll_min, "enroll_max": args.enroll_max,
                                "enroll_choices": args.enroll_choices, "max_mix_sec": round(max_mix, 3)}
     model.whisper.config.use_cache = False
@@ -241,7 +244,7 @@ def main():
 
     steps_per_epoch = len(train_dl) // args.grad_accum
     total_steps = args.max_steps if args.max_steps > 0 else steps_per_epoch * args.epochs
-    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    opt = torch.optim.AdamW(model.param_groups(args.lr, args.lr_pretrained, args.weight_decay))
     sched = get_cosine_schedule_with_warmup(opt, min(args.warmup_steps, total_steps // 10 + 1), total_steps)
     dtype = amp_dtype(args.precision, device)
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):

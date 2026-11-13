@@ -7,6 +7,11 @@ conditioning
            d_model and added to the encoder conv-stem output (baseline)
   none     mixture only (no-conditioning baseline)
 
+frontend   whisper  log-Mel + Whisper's conv stem (default)
+           ssl      WavLM reads [enrollment | separator | mixture] as raw audio; only its
+                    mixture frames (50 Hz, a weighted sum of all layers, projected to
+                    d_model) enter Whisper's encoder in place of the conv stem, starting at
+                    position 0. WavLM can stay frozen or be fine-tuned with everything else.
 separator  silence (the gap frames stay as they are) or learned (a trained vector
            replaces the encoder-stem frames of the gap)
 adaptation LoRA (default) or full fine-tuning
@@ -19,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import nullcontext
 from typing import Dict, List, Optional
 
 import torch
@@ -31,7 +37,8 @@ from .data import IGNORE, OTHER, OVL, TGT
 
 CONFIG_NAME = "tsasr_config.json"
 HEADS_NAME = "extra_heads.pt"
-HEAD_NAMES = ("spk_proj", "act_head", "c_proj", "sep_emb")
+HEAD_NAMES = ("spk_proj", "act_head", "c_proj", "sep_emb", "ssl_proj", "ssl_layer_w")  # newly initialised
+SSL_DIR = "ssl"
 
 
 class TSWhisper(nn.Module):
@@ -41,20 +48,25 @@ class TSWhisper(nn.Module):
                  lora_targets: List[str] = ("q_proj", "k_proj", "v_proj", "out_proj"),
                  spk_dim: int = 512, contrastive_dim: int = 256, tau: float = 0.1,
                  spk_encoder: str = "wavlm", separator: str = "silence", full_ft: bool = False,
-                 adapter_dir: Optional[str] = None, weights_dir: Optional[str] = None,
-                 use_lora: bool = True):
+                 frontend: str = "whisper", ssl_model: str = "microsoft/wavlm-base-plus",
+                 ssl_train: str = "full", adapter_dir: Optional[str] = None,
+                 weights_dir: Optional[str] = None, ssl_dir: Optional[str] = None, use_lora: bool = True):
         super().__init__()
         assert conditioning in ("prefix", "spk_emb", "none")
         assert aux in ("none", "activity", "contrastive")
         assert separator in ("silence", "learned")
-        if aux == "contrastive" and conditioning != "prefix":
-            raise ValueError("contrastive aux loss needs enrollment frames in the encoder (prefix)")
+        assert frontend in ("whisper", "ssl") and ssl_train in ("frozen", "full")
+        if aux == "contrastive" and (conditioning != "prefix" or frontend == "ssl"):
+            raise ValueError("contrastive aux loss needs enrollment frames in the Whisper encoder")
+        if frontend == "ssl" and (conditioning != "prefix" or separator == "learned"):
+            raise ValueError("the ssl frontend reads the enrollment itself: use conditioning=prefix, separator=silence")
         if model_name.endswith(".en"):
             raise ValueError("use a multilingual Whisper checkpoint (prompt uses <|en|><|transcribe|>)")
         self.cfg = dict(model_name=model_name, conditioning=conditioning, aux=aux, aux_weight=aux_weight,
                         lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
                         lora_targets=list(lora_targets), spk_dim=spk_dim, contrastive_dim=contrastive_dim,
                         tau=tau, spk_encoder=spk_encoder, separator=separator, full_ft=full_ft,
+                        frontend=frontend, ssl_model=ssl_model, ssl_train=ssl_train,
                         use_lora=use_lora and not full_ft)
         base = WhisperForConditionalGeneration.from_pretrained(weights_dir or model_name)
         base.config.forced_decoder_ids = None
@@ -73,10 +85,27 @@ class TSWhisper(nn.Module):
             self.whisper = self.peft.base_model.model
         d = base.config.d_model
         self.conditioning, self.aux, self.aux_weight, self.tau = conditioning, aux, aux_weight, tau
-        self.separator = separator
+        self.separator, self.frontend = separator, frontend
 
         self._spk_bias = None
         self._sep_mask = None
+        self._ssl_feats = None
+        if frontend == "ssl":
+            from transformers import AutoFeatureExtractor, AutoModel
+
+            self.ssl = AutoModel.from_pretrained(ssl_dir or ssl_model)
+            self.ssl_fe = AutoFeatureExtractor.from_pretrained(ssl_dir or ssl_model)
+            self.ssl_normalize = bool(getattr(self.ssl_fe, "do_normalize", False))
+            self.ssl_use_mask = bool(getattr(self.ssl_fe, "return_attention_mask", True))
+            for p in self.ssl.parameters():
+                p.requires_grad_(ssl_train == "full")
+            if hasattr(self.ssl, "freeze_feature_encoder"):
+                self.ssl.freeze_feature_encoder()  # the CNN waveform encoder stays frozen
+            self.ssl_layer_w = nn.Parameter(torch.zeros(self.ssl.config.num_hidden_layers + 1))
+            self.ssl_proj = nn.Linear(self.ssl.config.hidden_size, d)
+            enc = self.whisper.model.encoder
+            for p in list(enc.conv1.parameters()) + list(enc.conv2.parameters()):
+                p.requires_grad_(False)  # bypassed
         if conditioning == "spk_emb":
             self.spk_proj = nn.Linear(spk_dim, d)
             nn.init.zeros_(self.spk_proj.weight)  # starts as plain Whisper
@@ -92,6 +121,8 @@ class TSWhisper(nn.Module):
     # ----------------------------------------------------------------- conditioning
     def _stem_hook(self, module, inputs, output):
         """output: (B, d_model, 1500) conv-stem features before GELU and positions."""
+        if self._ssl_feats is not None:
+            output = self._ssl_feats.to(output.dtype)
         if self._spk_bias is not None:
             output = output + self._spk_bias.to(output.dtype)[:, :, None]
         if self._sep_mask is not None:
@@ -107,12 +138,44 @@ class TSWhisper(nn.Module):
             self._sep_mask = (t >= sep_span[:, :1]) & (t < sep_span[:, 1:2])
 
     def _clear_cond(self):
-        self._spk_bias, self._sep_mask = None, None
+        self._spk_bias, self._sep_mask, self._ssl_feats = None, None, None
+
+    def _ssl_frames(self, wav, wav_mask, mix_offset, mix_frames, n_pos: int = 1500):
+        """WavLM over the whole waveform, keep the mixture frames -> (B, d_model, n_pos)."""
+        x = wav.float()
+        if self.ssl_normalize:
+            m = wav_mask.float()
+            n = m.sum(1, keepdim=True).clamp(min=1.0)
+            mu = (x * m).sum(1, keepdim=True) / n
+            var = (((x - mu) * m) ** 2).sum(1, keepdim=True) / n
+            x = (x - mu) / torch.sqrt(var + 1e-7) * m
+        frozen = self.cfg["ssl_train"] == "frozen"
+        with torch.no_grad() if frozen else nullcontext():
+            out = self.ssl(x, attention_mask=wav_mask if self.ssl_use_mask else None, output_hidden_states=True)
+        hs = torch.stack(out.hidden_states, 0)  # (layers + 1, B, T, D)
+        w = torch.softmax(self.ssl_layer_w, 0).to(hs.dtype)
+        h = (w[:, None, None, None] * hs).sum(0)
+        B, T, D = h.shape
+        buf = h.new_zeros(B, n_pos, D)
+        for b in range(B):
+            s = int(mix_offset[b])
+            n = max(min(int(mix_frames[b]), T - s, n_pos), 0)
+            buf[b, :n] = h[b, s: s + n]
+        return self.ssl_proj(buf).transpose(1, 2)
+
+    def _dummy_features(self, ref: torch.Tensor):
+        return torch.zeros(ref.shape[0], self.whisper.config.num_mel_bins, 3000, device=ref.device,
+                           dtype=next(self.whisper.model.encoder.parameters()).dtype)
 
     # ----------------------------------------------------------------- training
-    def forward(self, input_features, decoder_input_ids, labels, spk_emb=None, frame_labels=None,
-                enroll_span=None, sep_span=None, **_) -> Dict[str, torch.Tensor]:
+    def forward(self, input_features=None, decoder_input_ids=None, labels=None, spk_emb=None, frame_labels=None,
+                enroll_span=None, sep_span=None, wav=None, wav_mask=None, mix_offset=None, mix_frames=None,
+                **_) -> Dict[str, torch.Tensor]:
+        if self.frontend == "ssl":
+            input_features = self._dummy_features(wav)
         self._set_cond(spk_emb, sep_span, input_features.shape[-1] // 2)
+        if self.frontend == "ssl":
+            self._ssl_feats = self._ssl_frames(wav, wav_mask, mix_offset, mix_frames)
         try:
             enc = self.whisper.model.encoder(input_features).last_hidden_state
         finally:
@@ -152,9 +215,14 @@ class TSWhisper(nn.Module):
 
     # ----------------------------------------------------------------- inference
     @torch.no_grad()
-    def generate(self, input_features, spk_emb=None, sep_span=None, num_beams: int = 1,
-                 max_new_tokens: int = 220, prompt_ids: Optional[torch.Tensor] = None):
+    def generate(self, input_features=None, spk_emb=None, sep_span=None, num_beams: int = 1,
+                 max_new_tokens: int = 220, prompt_ids: Optional[torch.Tensor] = None,
+                 wav=None, wav_mask=None, mix_offset=None, mix_frames=None):
+        if self.frontend == "ssl":
+            input_features = self._dummy_features(wav)
         self._set_cond(spk_emb, sep_span, input_features.shape[-1] // 2)
+        if self.frontend == "ssl":
+            self._ssl_feats = self._ssl_frames(wav, wav_mask, mix_offset, mix_frames)
         kw = {"prompt_ids": prompt_ids} if prompt_ids is not None else {}
         try:
             return self.whisper.generate(input_features=input_features, language="en", task="transcribe",
@@ -165,6 +233,18 @@ class TSWhisper(nn.Module):
     # ----------------------------------------------------------------- io
     def trainable_parameters(self):
         return [p for p in self.parameters() if p.requires_grad]
+
+    def param_groups(self, lr_new: float, lr_pretrained: float, weight_decay: float = 0.01):
+        """New parameters (LoRA, projections, heads) and pretrained weights (Whisper under
+        --full-ft, a fine-tuned WavLM) get separate learning rates."""
+        new, pre = [], []
+        for n, p in self.named_parameters():
+            if p.requires_grad:
+                (new if ("lora_" in n or n.split(".")[0] in HEAD_NAMES) else pre).append(p)
+        groups = [{"params": new, "lr": lr_new, "weight_decay": weight_decay}]
+        if pre:
+            groups.append({"params": pre, "lr": lr_pretrained, "weight_decay": weight_decay})
+        return groups
 
     def save(self, out_dir: str):
         os.makedirs(out_dir, exist_ok=True)
@@ -178,6 +258,9 @@ class TSWhisper(nn.Module):
             if m is not None:
                 heads[n] = m.detach().cpu() if isinstance(m, nn.Parameter) else m.state_dict()
         torch.save(heads, os.path.join(out_dir, HEADS_NAME))
+        if self.frontend == "ssl" and self.cfg["ssl_train"] == "full":
+            self.ssl.save_pretrained(os.path.join(out_dir, SSL_DIR))
+            self.ssl_fe.save_pretrained(os.path.join(out_dir, SSL_DIR))
         with open(os.path.join(out_dir, CONFIG_NAME), "w") as f:
             json.dump(self.cfg, f, indent=2)
 
@@ -186,10 +269,12 @@ class TSWhisper(nn.Module):
         with open(os.path.join(ckpt_dir, CONFIG_NAME)) as f:
             cfg = json.load(f)
         train_data = cfg.pop("train_data", {})
+        ssl_dir = os.path.join(ckpt_dir, SSL_DIR)
+        extra = {"ssl_dir": ssl_dir} if os.path.isdir(ssl_dir) else {}
         if cfg.get("full_ft"):
-            m = cls(**cfg, weights_dir=ckpt_dir)
+            m = cls(**cfg, weights_dir=ckpt_dir, **extra)
         else:
-            m = cls(**cfg, adapter_dir=ckpt_dir if cfg.get("use_lora", True) else None)
+            m = cls(**cfg, adapter_dir=ckpt_dir if cfg.get("use_lora", True) else None, **extra)
         heads = torch.load(os.path.join(ckpt_dir, HEADS_NAME), map_location=map_location)
         for n, v in heads.items():
             target = getattr(m, n)

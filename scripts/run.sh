@@ -6,7 +6,7 @@
 #
 # Data:      data, prep
 # Training:  train_prefix (ours) | train_none (no conditioning) | train_spk (WavLM x-vector)
-#            train_spk_titanet | train_learned_sep | train_fullft | train_len_ablation
+#            train_spk_titanet | train_learned_sep | train_fullft | train_len_ablation | train_wavlm
 #            train_aug | train_aux
 # Baselines: zeroshot, dicow
 # Analyses:  eval CKPT (controls + output change, lengths, quality, Libri3Mix, AMI
@@ -99,7 +99,8 @@ case "${1:?stage}" in
   train_spk)          "${TRAIN[@]}" --conditioning spk_emb --spk-encoder wavlm --out-dir "$EXP/spk_wavlm" ;;
   train_spk_titanet)  "${TRAIN[@]}" --conditioning spk_emb --spk-encoder titanet --out-dir "$EXP/spk_titanet" ;;
   train_learned_sep)  "${TRAIN[@]}" --separator learned --out-dir "$EXP/prefix_learnedsep" ;;
-  train_fullft)       "${TRAIN[@]}" --full-ft --lr 1e-5 --out-dir "$EXP/prefix_fullft" ;;
+  train_fullft)       "${TRAIN[@]}" --full-ft --out-dir "$EXP/prefix_fullft" ;;
+  train_wavlm)        "${TRAIN[@]}" --frontend ssl --separator none --full-ft --out-dir "$EXP/wavlm" ;;
   train_len_ablation) "${TRAIN[@]}" --enroll-min 1 --enroll-max 10 --out-dir "$EXP/prefix_len1to10" ;;
   train_aug)
     for a in mix_only both_shared both_indep; do

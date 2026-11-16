@@ -390,3 +390,52 @@ def test_frozen_ssl_stays_in_eval_mode(tmp_path):
     m = _tiny_ssl_model(tmp_path, "frozen")
     m.train()
     assert m.training and not m.ssl.training and m.ssl.config.layerdrop == 0.0
+
+
+def test_ranking_negative_keeps_mixture_position():
+    from tsasr.data import Collator, DataConfig, _Base
+
+    ds = _Base(_StubFE(), _StubTokens(), DataConfig(rank_negative=True))
+    rng = np.random.default_rng(0)
+    for neg in (tone(2.0), tone(8.0), None):  # shorter, longer, missing (silence)
+        item = ds._finish("m__s1", tone(9.5), None, 0, ["a"], tone(5.0), rng, neg_enroll=neg)
+        assert item["sep_span_neg"] == item["sep_span"]  # mixture starts at the same frame
+        assert item["input_features_neg"].shape == item["input_features"].shape
+    b = Collator(0)([{**item, "dec_in": [1, 2], "labels": [3, 4]}] * 2)
+    assert b["input_features_neg"].shape == b["input_features"].shape and b["sep_span_neg"].shape == (2, 2)
+    plain = _Base(_StubFE(), _StubTokens(), DataConfig())._finish("m__s1", tone(9.5), None, 0, ["a"], tone(5.0), rng)
+    assert "input_features_neg" not in plain
+
+
+def test_ranking_loss_and_init_from_tiny(tmp_path):
+    import torch
+
+    from tsasr.model import TSWhisper
+
+    m = TSWhisper("openai/whisper-tiny", aux="ranking", rank_margin=1.0)
+    feats = torch.randn(2, 80, 3000)
+    dec = torch.tensor([[50258, 50259, 50359, 50363, 400, 401], [50258, 50259, 50359, 50363, 402, 403]])
+    lab = torch.tensor([[-100, -100, -100, 400, 401, 50257], [-100, -100, -100, 402, 403, 50257]])
+    out = m(input_features=feats, decoder_input_ids=dec, labels=lab, input_features_neg=torch.randn(2, 80, 3000))
+    assert "aux" in out and out["aux"].item() >= 0 and torch.isfinite(out["loss"])
+    out["loss"].backward()
+    assert any(p.grad is not None for n, p in m.named_parameters() if "lora_" in n)
+    # identical positive and negative inputs: the gap is 0, so the hinge equals the margin
+    same = m(input_features=feats, decoder_input_ids=dec, labels=lab, input_features_neg=feats)
+    assert abs(same["aux"].item() - 1.0) < 1e-4
+    # a saved model reloads with a trainable adapter for fine-tuning, and frozen by default
+    m.save(str(tmp_path / "ck"))
+    ft = TSWhisper.load(str(tmp_path / "ck"), trainable=True)
+    assert ft.aux == "ranking" and ft.rank_margin == 1.0
+    assert any(p.requires_grad for n, p in ft.named_parameters() if "lora_" in n)
+    assert not any(p.requires_grad for n, p in TSWhisper.load(str(tmp_path / "ck")).named_parameters())
+
+
+def test_ami_train_sessions(tmp_path):
+    from tsasr.ami import AMI_DEV, AMI_TEST, train_sessions
+
+    (tmp_path / "words").mkdir()
+    for s in ["ES2002a", "EN2001a", AMI_TEST[0], AMI_DEV[0], "TS3005b"]:
+        (tmp_path / "words" / f"{s}.A.words.xml").write_text("<nite/>")
+        (tmp_path / "words" / f"{s}.B.words.xml").write_text("<nite/>")
+    assert train_sessions(str(tmp_path)) == ["EN2001a", "ES2002a", "TS3005b"]

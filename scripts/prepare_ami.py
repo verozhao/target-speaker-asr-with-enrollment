@@ -25,14 +25,14 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tsasr.ami import (AMI_DEV, AMI_TEST, _h, merge, pick_region, read_speaker_map, read_words,  # noqa: E402
-                       solo_regions, target_windows, text_of, words_in)
+                       solo_regions, target_windows, text_of, train_sessions, words_in)
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--annotations", required=True, help="unzipped ami_public_manual_1.6.2")
     p.add_argument("--audio-dir", required=True, help="holds <session>.Array1-01.wav")
-    p.add_argument("--split", default="test", choices=["test", "dev"])
+    p.add_argument("--split", default="test", choices=["test", "dev", "train"])
     p.add_argument("--sessions", nargs="*", default=None, help="override the session list")
     p.add_argument("--out", required=True)
     p.add_argument("--max-len", type=float, default=24.5)
@@ -41,7 +41,7 @@ def main():
     p.add_argument("--min-enroll", type=float, default=2.0, help="shortest usable solo stretch")
     a = p.parse_args()
 
-    sessions = a.sessions or (AMI_TEST if a.split == "test" else AMI_DEV)
+    sessions = a.sessions or {"test": AMI_TEST, "dev": AMI_DEV}.get(a.split) or train_sessions(a.annotations)
     audio = {s: os.path.abspath(os.path.join(a.audio_dir, f"{s}.Array1-01.wav")) for s in sessions}
     missing = [s for s, f in audio.items() if not os.path.exists(f)]
     if missing:

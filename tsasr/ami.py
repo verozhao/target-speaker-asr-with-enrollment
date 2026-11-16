@@ -22,6 +22,18 @@ AMI_DEV = [f"{s}{x}" for s in ("ES2011", "IS1008", "TS3004") for x in "abcd"] + 
           ["IB4001", "IB4002", "IB4003", "IB4004", "IB4005", "IB4010", "IB4011"]
 
 
+def annotated_sessions(annotation_dir: str) -> List[str]:
+    """Every session with word annotations."""
+    return sorted({os.path.basename(f).split(".")[0]
+                   for f in glob.glob(os.path.join(annotation_dir, "words", "*.words.xml"))})
+
+
+def train_sessions(annotation_dir: str) -> List[str]:
+    """Full-corpus ASR training partition: every annotated session outside dev and test."""
+    held = set(AMI_DEV) | set(AMI_TEST)
+    return [s for s in annotated_sessions(annotation_dir) if s not in held]
+
+
 def _h(*parts) -> int:
     return int(hashlib.sha1("|".join(map(str, parts)).encode()).hexdigest()[:12], 16)
 

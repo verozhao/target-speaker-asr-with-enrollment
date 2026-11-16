@@ -19,6 +19,9 @@ aux        optional auxiliary loss on the final encoder states:
            activity     frame-level target-speaker activity (BCE) on mixture frames
            contrastive  pooled enrollment frames closer to target-only than to
                         interferer-only frames of the same mixture (2-way InfoNCE)
+           ranking      the target transcript must be more likely with the target's
+                        enrollment than with an interferer's enrollment on the same
+                        mixture: hinge on the per-token NLL gap, max(0, m + nll_pos - nll_neg)
 """
 from __future__ import annotations
 
@@ -50,14 +53,17 @@ class TSWhisper(nn.Module):
                  spk_encoder: str = "wavlm", separator: str = "silence", full_ft: bool = False,
                  frontend: str = "whisper", ssl_model: str = "microsoft/wavlm-base-plus",
                  ssl_train: str = "full", adapter_dir: Optional[str] = None,
-                 weights_dir: Optional[str] = None, ssl_dir: Optional[str] = None, use_lora: bool = True):
+                 weights_dir: Optional[str] = None, ssl_dir: Optional[str] = None, use_lora: bool = True,
+                 rank_margin: float = 1.0, adapter_trainable: bool = False):
         super().__init__()
         assert conditioning in ("prefix", "spk_emb", "none")
-        assert aux in ("none", "activity", "contrastive")
+        assert aux in ("none", "activity", "contrastive", "ranking")
         assert separator in ("silence", "learned")
         assert frontend in ("whisper", "ssl") and ssl_train in ("frozen", "full")
         if aux == "contrastive" and (conditioning != "prefix" or frontend == "ssl"):
             raise ValueError("contrastive aux loss needs enrollment frames in the Whisper encoder")
+        if aux == "ranking" and (conditioning != "prefix" or frontend == "ssl"):
+            raise ValueError("ranking aux loss needs the audio prefix with the Whisper front-end")
         if frontend == "ssl" and (conditioning != "prefix" or separator == "learned"):
             raise ValueError("the ssl frontend reads the enrollment itself: use conditioning=prefix, separator=silence")
         if model_name.endswith(".en"):
@@ -67,7 +73,7 @@ class TSWhisper(nn.Module):
                         lora_targets=list(lora_targets), spk_dim=spk_dim, contrastive_dim=contrastive_dim,
                         tau=tau, spk_encoder=spk_encoder, separator=separator, full_ft=full_ft,
                         frontend=frontend, ssl_model=ssl_model, ssl_train=ssl_train,
-                        use_lora=use_lora and not full_ft)
+                        use_lora=use_lora and not full_ft, rank_margin=rank_margin)
         base = WhisperForConditionalGeneration.from_pretrained(weights_dir or model_name)
         base.config.forced_decoder_ids = None
         base.generation_config.forced_decoder_ids = None
@@ -77,7 +83,7 @@ class TSWhisper(nn.Module):
         if full_ft or not use_lora:
             self.peft, self.whisper = None, base
         elif adapter_dir is not None:
-            self.peft = PeftModel.from_pretrained(base, adapter_dir, is_trainable=False)
+            self.peft = PeftModel.from_pretrained(base, adapter_dir, is_trainable=adapter_trainable)
             self.whisper = self.peft.base_model.model
         else:
             lcfg = LoraConfig(r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
@@ -86,6 +92,7 @@ class TSWhisper(nn.Module):
             self.whisper = self.peft.base_model.model
         d = base.config.d_model
         self.conditioning, self.aux, self.aux_weight, self.tau = conditioning, aux, aux_weight, tau
+        self.rank_margin = rank_margin
         self.separator, self.frontend = separator, frontend
 
         self._spk_bias = None
@@ -181,7 +188,7 @@ class TSWhisper(nn.Module):
     # ----------------------------------------------------------------- training
     def forward(self, input_features=None, decoder_input_ids=None, labels=None, spk_emb=None, frame_labels=None,
                 enroll_span=None, sep_span=None, wav=None, wav_mask=None, mix_offset=None, mix_frames=None,
-                **_) -> Dict[str, torch.Tensor]:
+                input_features_neg=None, sep_span_neg=None, **_) -> Dict[str, torch.Tensor]:
         if self.frontend == "ssl":
             input_features = self._dummy_features(wav)
         self._set_cond(spk_emb, sep_span, input_features.shape[-1] // 2)
@@ -197,6 +204,15 @@ class TSWhisper(nn.Module):
             res["aux"] = self._activity_loss(enc, frame_labels)
         elif self.aux == "contrastive":
             res["aux"] = self._contrastive_loss(enc, frame_labels, enroll_span)
+        elif self.aux == "ranking" and input_features_neg is not None:
+            # same mixture and target transcript, the enrollment of another speaker
+            self._set_cond(None, sep_span_neg, input_features_neg.shape[-1] // 2)
+            try:
+                enc_neg = self.whisper.model.encoder(input_features_neg).last_hidden_state
+            finally:
+                self._clear_cond()
+            neg = self.whisper(encoder_outputs=(enc_neg,), decoder_input_ids=decoder_input_ids)
+            res["aux"] = self._ranking_loss(out.logits, neg.logits, labels)
         if "aux" in res:
             res["loss"] = out.loss + self.aux_weight * res["aux"]
         return res
@@ -208,6 +224,17 @@ class TSWhisper(nn.Module):
             return logits.sum() * 0.0
         target = ((fl == TGT) | (fl == OVL)).float()
         return F.binary_cross_entropy_with_logits(logits[valid], target[valid])
+
+    @staticmethod
+    def _seq_nll(logits, labels):
+        """Mean per-token NLL of each sequence, (B,)."""
+        nll = F.cross_entropy(logits.float().transpose(1, 2), labels, ignore_index=-100, reduction="none")
+        m = (labels != -100).float()
+        return (nll * m).sum(1) / m.sum(1).clamp(min=1.0)
+
+    def _ranking_loss(self, logits_pos, logits_neg, labels):
+        gap = self._seq_nll(logits_neg, labels) - self._seq_nll(logits_pos, labels)
+        return F.relu(self.rank_margin - gap).mean()
 
     def _contrastive_loss(self, enc, fl, enroll_span, min_frames: int = 5):
         losses = []
@@ -288,7 +315,8 @@ class TSWhisper(nn.Module):
             json.dump(self.cfg, f, indent=2)
 
     @classmethod
-    def load(cls, ckpt_dir: str, map_location="cpu") -> "TSWhisper":
+    def load(cls, ckpt_dir: str, map_location="cpu", trainable: bool = False) -> "TSWhisper":
+        """trainable=True keeps the LoRA adapter trainable (fine-tuning from a checkpoint)."""
         with open(os.path.join(ckpt_dir, CONFIG_NAME)) as f:
             cfg = json.load(f)
         train_data = cfg.pop("train_data", {})
@@ -297,7 +325,8 @@ class TSWhisper(nn.Module):
         if cfg.get("full_ft"):
             m = cls(**cfg, weights_dir=ckpt_dir, **extra)
         else:
-            m = cls(**cfg, adapter_dir=ckpt_dir if cfg.get("use_lora", True) else None, **extra)
+            m = cls(**cfg, adapter_dir=ckpt_dir if cfg.get("use_lora", True) else None,
+                    adapter_trainable=trainable, **extra)
         heads = torch.load(os.path.join(ckpt_dir, HEADS_NAME), map_location=map_location)
         for n, v in heads.items():
             target = getattr(m, n)

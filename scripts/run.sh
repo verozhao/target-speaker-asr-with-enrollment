@@ -8,7 +8,8 @@
 # Data:      data, prep
 # Training:  train_prefix (ours) | train_none (no conditioning) | train_spk (WavLM x-vector)
 #            train_spk_titanet | train_learned_sep | train_fullft | train_len_ablation | train_wavlm
-#            train_aug | train_aux
+#            train_aug | train_aux | train_rank (ranking loss)
+# AMI:       ami_train_data (download + manifests), train_ami (fine-tune a trained model on AMI)
 # Baselines: zeroshot, dicow
 # Analyses:  eval CKPT (controls + output change, lengths, quality, Libri3Mix, AMI
 #            same/other session), context, explore CKPT (position, text prompt),
@@ -26,6 +27,9 @@ AUG=$DATA/aug
 T2=$DATA/libri2mix_test.jsonl
 T3=$DATA/libri3mix_test.jsonl
 AMI_T=$DATA/ami_test.jsonl
+AMI_TR=$DATA/ami_train.jsonl
+AMI_DEV=$DATA/ami_dev.jsonl
+MAIN_CKPT=${MAIN_CKPT:-$EXP/prefix_len1to10/best}   # model that train_ami starts from
 TRAIN_SOURCE=${TRAIN_SOURCE:-ls960}
 if [ "$TRAIN_SOURCE" = "ls960" ]; then
   TRAIN_DATA=(--train-index "$DATA/librispeech_960_index.json")
@@ -113,6 +117,20 @@ case "${1:?stage}" in
     for x in activity contrastive; do
       "${TRAIN[@]}" "${AUG_TRAIN[@]}" --aug both_indep --aux "$x" --out-dir "$EXP/prefix_aug_both_indep_aux_$x"
     done ;;
+  train_rank)
+    # random 1-10 s enrollment (the main recipe) plus the ranking loss
+    "${TRAIN[@]}" --enroll-min 1 --enroll-max 10 --aux ranking --out-dir "$EXP/prefix_len1to10_rank" ;;
+  ami_train_data)
+    bash scripts/get_ami.sh "$STORAGE" train
+    bash scripts/get_ami.sh "$STORAGE" dev
+    python scripts/prepare_ami.py --annotations "$STORAGE/ami/annotations" --audio-dir "$STORAGE/ami/audio" \
+      --split train --enroll-len 10 --out "$AMI_TR"
+    python scripts/prepare_ami.py --annotations "$STORAGE/ami/annotations" --audio-dir "$STORAGE/ami/audio" \
+      --split dev --out "$AMI_DEV" ;;
+  train_ami)
+    # fine-tune on AMI train, select on AMI dev; long windows get a shorter enrollment automatically
+    python scripts/train.py --train-manifest "$AMI_TR" --dev-manifest "$AMI_DEV" --init-from "$MAIN_CKPT" \
+      --enroll-min 1 --enroll-max 10 --max-mix-sec 24.5 --lr 1e-4 --epochs 2 --out-dir "$EXP/ami_ft" ;;
   eval)
     eval_ckpt "${2:?usage: run.sh eval exp/<run>/best}" ;;
   eval_baselines)

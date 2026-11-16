@@ -96,6 +96,8 @@ class DataConfig:
     # frame labels for the auxiliary losses
     frame_labels: bool = False
     act_rel_db: float = 30.0
+    # ranking loss: also build the same input with another speaker's enrollment
+    rank_negative: bool = False
     seed: int = 0
 
 
@@ -133,7 +135,7 @@ class _Base(Dataset):
         lo = min(c.enroll_min, hi)
         return float(rng.uniform(lo, hi)) if hi > lo else hi
 
-    def _finish(self, ex_id, mixture, sources, k, texts, enroll, rng, enroll_is_silence=False):
+    def _finish(self, ex_id, mixture, sources, k, texts, enroll, rng, enroll_is_silence=False, neg_enroll=None):
         """sources: per-speaker signals aligned with `mixture` (or None)."""
         c = self.cfg
         if c.train and self.augmenter is not None:
@@ -172,12 +174,31 @@ class _Base(Dataset):
                 wav = wav[:WHISPER_WINDOW_SAMPLES]
             feats = self.fe(wav, sampling_rate=SAMPLE_RATE, return_tensors="np").input_features[0]
             item["input_features"] = feats.astype(np.float32)
+        if c.rank_negative and use_enroll:
+            item.update(self._negative(neg_enroll, enroll, mixture, lead, rng))
         if c.conditioning == "spk_emb":
             item["enroll_wav"] = enroll if enroll is not None else np.zeros(SAMPLE_RATE, np.float32)
         if c.frame_labels:
             off = 0 if c.frontend == "ssl" else spans["mix"][0]  # ssl: mixture frames start at 0
             item["frame_labels"] = self._frame_labels(sources, k, off)
         return item
+
+    def _negative(self, neg, enroll, mixture, lead, rng):
+        """The same mixture behind another speaker's enrollment, padded or cut to the
+        target enrollment's length so the mixture keeps its position. Without another
+        enrollment the negative is silence."""
+        c = self.cfg
+        if neg is None:
+            neg = np.zeros_like(enroll)
+        else:
+            if c.train and self.augmenter is not None:
+                neg = self.augmenter(neg, mixture, rng)[0]
+            neg = rms_normalize(neg)
+        neg = np.pad(neg, (0, max(len(enroll) - len(neg), 0)))[: len(enroll)].astype(np.float32)
+        wav, spans = compose_input(neg, mixture, c.gap_sec, c.position, lead)
+        wav = wav[:WHISPER_WINDOW_SAMPLES]
+        feats = self.fe(wav, sampling_rate=SAMPLE_RATE, return_tensors="np").input_features[0]
+        return {"input_features_neg": feats.astype(np.float32), "sep_span_neg": spans["sep"]}
 
     def _frame_labels(self, sources, k, off):
         fl = np.full(WHISPER_ENC_FRAMES, IGNORE, dtype=np.int8)
@@ -233,6 +254,18 @@ class ManifestDataset(_Base):
             return ex.get("other_enrollment")
         return None
 
+    def _negative_source(self, ex, rng) -> Optional[dict]:
+        """An enrollment of another speaker in the mixture (ranking loss)."""
+        k = ex["target_index"]
+        others = [j for j in range(len(ex["speakers"])) if j != k]
+        if self.pool and others:
+            spk = ex["speakers"][others[int(rng.integers(len(others)))]]
+            excl = set(ex.get("source_utts", []))
+            cands = [u for u in self.pool.get(spk, []) if u["utt_id"] not in excl]
+            if cands:
+                return cands[int(rng.integers(len(cands)))]
+        return ex.get("interferer_enrollment")
+
     def __getitem__(self, i):
         ex = self.ex[i]
         c = self.cfg
@@ -257,7 +290,12 @@ class ManifestDataset(_Base):
             enroll = self._load_enroll(src, self._enroll_len(len(mixture) / SAMPLE_RATE, rng), rng)
             if not c.train and c.enroll_mode == "silence":
                 enroll, silence = np.zeros_like(enroll), True
-        return self._finish(ex["id"], mixture, sources, k, ex["texts"], enroll, rng, silence)
+        neg = None
+        if c.rank_negative and enroll is not None:
+            nsrc = self._negative_source(ex, rng)
+            if nsrc is not None:
+                neg = self._load_enroll(nsrc, len(enroll) / SAMPLE_RATE, rng)
+        return self._finish(ex["id"], mixture, sources, k, ex["texts"], enroll, rng, silence, neg)
 
 
 # kept for code that still imports the old name
@@ -329,8 +367,15 @@ class OnTheFlyMixDataset(_Base):
             cands = long_enough or cands
             src = cands[int(rng.integers(len(cands)))]
             enroll = self._load_enroll(src, self._enroll_len(len(mix) / SAMPLE_RATE, rng), rng)
+        neg = None
+        if c.rank_negative and enroll is not None and n > 1:
+            j = [x for x in range(n) if x != k][int(rng.integers(n - 1))]
+            ncands = [u for u in self.enroll_pool[spks[j]] if u["utt_id"] != utts[j]["utt_id"]]
+            if ncands:
+                neg = self._load_enroll(ncands[int(rng.integers(len(ncands)))], len(enroll) / SAMPLE_RATE, rng)
         return self._finish(f"otf-e{self.epoch}-{i}__s{k + 1}", mix.astype(np.float32),
-                            positioned if c.frame_labels else None, k, [u["text"] for u in utts], enroll, rng)
+                            positioned if c.frame_labels else None, k, [u["text"] for u in utts], enroll, rng,
+                            neg_enroll=neg)
 
 
 class Collator:
@@ -355,6 +400,9 @@ class Collator:
         }
         if "input_features" in batch[0]:
             out["input_features"] = torch.from_numpy(np.stack([b["input_features"] for b in batch]))
+        if "input_features_neg" in batch[0]:
+            out["input_features_neg"] = torch.from_numpy(np.stack([b["input_features_neg"] for b in batch]))
+            out["sep_span_neg"] = torch.tensor([b["sep_span_neg"] for b in batch], dtype=torch.long)
         if "wav" in batch[0]:
             n = max(len(b["wav"]) for b in batch)
             w = torch.zeros(len(batch), n)

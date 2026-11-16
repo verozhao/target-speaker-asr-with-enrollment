@@ -7,6 +7,7 @@ Training data, one of:
 Single GPU:   python scripts/train.py --train-index ... --dev-manifest ... --out-dir exp/prefix
 Multi GPU:    torchrun --nproc_per_node 4 scripts/train.py ...
 Re-running the same command resumes from <out-dir>/last automatically.
+Fine-tune a trained model on new data (e.g. AMI):  --init-from exp/<run>/best
 """
 import argparse
 import datetime
@@ -57,8 +58,11 @@ def parse_args():
     p.add_argument("--position", default="prefix", choices=["prefix", "suffix"], help="enrollment before/after the mixture")
     p.add_argument("--random-lead", action="store_true", help="random start position inside the 30 s window")
     p.add_argument("--full-ft", action="store_true", help="full fine-tuning of Whisper instead of LoRA")
-    p.add_argument("--aux", default="none", choices=["none", "activity", "contrastive"])
+    p.add_argument("--aux", default="none", choices=["none", "activity", "contrastive", "ranking"])
     p.add_argument("--aux-weight", type=float, default=0.1)
+    p.add_argument("--rank-margin", type=float, default=1.0, help="ranking loss: required per-token NLL gap")
+    p.add_argument("--init-from", default=None,
+                   help="start from a trained checkpoint (its conditioning, front-end and separator are kept)")
     # augmentation
     p.add_argument("--aug", default="none", choices=TRAIN_MODES)
     p.add_argument("--noise-list", default=None)
@@ -103,6 +107,17 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max-train-examples", type=int, default=None, help="debug: cap training set")
     a = p.parse_args()
+    if a.init_from:
+        # the architecture and input layout come from the checkpoint
+        with open(os.path.join(a.init_from, "tsasr_config.json")) as f:
+            ck = json.load(f)
+        td = ck.get("train_data", {})
+        a.conditioning, a.frontend, a.spk_encoder = ck["conditioning"], ck["frontend"], ck.get("spk_encoder", "wavlm")
+        a.separator = td.get("separator", ck.get("separator", "silence"))
+        a.gap, a.position = td.get("gap", a.gap), td.get("position", a.position)
+        a.full_ft, a.model = bool(ck.get("full_ft")), ck.get("model_name", a.model)
+    if a.aux == "ranking" and (a.conditioning != "prefix" or a.frontend != "whisper"):
+        raise SystemExit("--aux ranking needs --conditioning prefix and the Whisper front-end")
     if a.gap is None:
         a.gap = {"learned": 0.02, "none": 0.0}.get(a.separator, 0.5)
     a.enroll_choices = tuple(float(x) for x in a.enroll_choices.split(",")) if a.enroll_choices else None
@@ -186,7 +201,8 @@ def main():
                            random_lead=args.random_lead, frontend=args.frontend, train=True,
                            enroll_min=args.enroll_min, enroll_max=args.enroll_max, enroll_choices=args.enroll_choices,
                            random_enrollment=not args.no_random_enrollment,
-                           frame_labels=args.aux != "none", seed=args.seed)
+                           frame_labels=args.aux in ("activity", "contrastive"),
+                           rank_negative=args.aux == "ranking", seed=args.seed)
     # every system trains on the same mixtures: those that fit next to the longest enrollment
     # the 0.5 s reference separator keeps the pool identical for silence/learned/none separators
     max_mix = args.max_mix_sec or max_mixture_sec(args.enroll_max, max(args.gap, 0.5))
@@ -224,13 +240,25 @@ def main():
 
     # ---------------------------------------------------------------- model
     spk_enc = SpeakerEncoder(args.spk_encoder).to(device) if args.conditioning == "spk_emb" else None
-    model = TSWhisper(args.model, conditioning=args.conditioning, aux=args.aux, aux_weight=args.aux_weight,
-                      lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
-                      lora_targets=args.lora_targets.split(","),
-                      spk_dim=spk_enc.dim if spk_enc is not None else 512,
-                      spk_encoder=args.spk_encoder, separator="learned" if args.separator == "learned" else "silence",
-                      full_ft=args.full_ft, frontend=args.frontend, ssl_model=args.ssl_model,
-                      ssl_train=args.ssl_train).to(device)
+    if args.init_from:
+        model = TSWhisper.load(args.init_from, trainable=True)
+        if args.aux in ("none", "ranking"):  # losses without extra heads can be switched on here
+            model.aux, model.cfg["aux"] = args.aux, args.aux
+            model.aux_weight, model.cfg["aux_weight"] = args.aux_weight, args.aux_weight
+            model.rank_margin, model.cfg["rank_margin"] = args.rank_margin, args.rank_margin
+        elif args.aux != model.aux:
+            raise SystemExit(f"--init-from keeps the checkpoint's aux loss ({model.aux})")
+        model = model.to(device)
+        log({"event": "init_from", "ckpt": args.init_from, "aux": model.aux})
+    else:
+        model = TSWhisper(args.model, conditioning=args.conditioning, aux=args.aux, aux_weight=args.aux_weight,
+                          lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+                          lora_targets=args.lora_targets.split(","),
+                          spk_dim=spk_enc.dim if spk_enc is not None else 512,
+                          spk_encoder=args.spk_encoder,
+                          separator="learned" if args.separator == "learned" else "silence",
+                          full_ft=args.full_ft, frontend=args.frontend, ssl_model=args.ssl_model,
+                          ssl_train=args.ssl_train, rank_margin=args.rank_margin).to(device)
     # data settings the evaluator must reuse
     model.cfg["train_data"] = {"gap": args.gap, "position": args.position, "separator": args.separator,
                                "enroll_min": args.enroll_min, "enroll_max": args.enroll_max,
